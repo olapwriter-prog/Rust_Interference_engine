@@ -24,6 +24,8 @@ pub mod model;
 pub mod ops;
 pub mod quant;
 pub mod sampler;
+#[doc(hidden)]
+pub mod testing;
 pub mod tensor;
 pub mod threadpool;
 pub mod tokenizer;
