@@ -91,3 +91,34 @@ choices the model already considers plausible. They do not teach new facts.
 (`tools` + `tool_choice: auto`, `stream_options.include_usage`, tool-call deltas merged by
 index, tool results sent back) and runs a short agent loop: a forced tool call, an error
 result that triggers auto-reward, then feedback and a correction. CI runs it on every push.
+
+## Sandboxed end-to-end test with the real harness
+
+`scripts/sandbox-harness.sh HARNESS_DIR MODEL.gguf [harness args]` runs the real stitaP
+harness against `rie-server` inside Linux namespaces:
+- no internet: a private network with loopback only, and `rie-server` runs inside it;
+- the harness checkout is mounted read-only;
+- a throwaway home directory, with approvals set to `deny`.
+
+```bash
+scripts/sandbox-harness.sh ~/tool-harness model.gguf doctor
+SERVER_ARGS="--tool-choice required" scripts/sandbox-harness.sh ~/tool-harness model.gguf \
+    batch prompts.jsonl --out /tmp/traj.jsonl
+```
+
+`requests.jsonl` in `$WORK` logs every request together with what the server generated
+(set `RIE_SERVER_LOG=file` to get the same log from any server).
+
+What running the real harness this way uncovered and fixed:
+
+| Finding | Fix |
+|---|---|
+| The harness's `use_tool` meta-tool takes a free-form `arguments` object. A small model kept adding keys until it hit `max_tokens`, and the harness received an empty reply | A size budget per call (`--max-call`, default 16 KB): past it the call *winds down*, meaning strings close, no new keys or items are added (except missing required ones) and containers close, always ending in a valid call. Free-form object keys are now length-capped too |
+| Auto-reward on long tool calls (100–300 tokens, repeated) made the correction experts diverge (weights up to 1e19, then NaN) | The learning rate is scaled by 1/√length for trajectory rewards, every update is clipped, A is bounded, B rows keep their norm, router rows are norm-capped, non-finite updates are rejected, and adapter files with non-finite weights are refused. A 300-step × 20-round stress test is part of the suite. Corrections stay full strength |
+| `write_file` was executed despite `approvals: deny` | Harness behaviour (deny seems to cover only some tools). Keep the checkout read-only, or run in a sandbox, when testing |
+
+With a random-weight test model the harness accepts every call `rie-server` produces
+(its own validation passes), tool results come back, and auto-reward learns from the
+failures. Judging the agent's actual task success needs a real instruct model (for
+example Qwen2.5-1.5B/3B-Instruct), which could not be downloaded in the environment where
+this was developed.

@@ -179,7 +179,10 @@ impl CorrectionExperts {
         let (g, u) = self.route(&hu);
         for (&tok, row) in &self.a {
             if let Some(l) = logits.get_mut(tok as usize) {
-                *l += self.shift(row, &g, &u);
+                let d = self.shift(row, &g, &u);
+                if d.is_finite() {
+                    *l += d;
+                }
             }
         }
     }
@@ -192,11 +195,24 @@ impl CorrectionExperts {
     /// REINFORCE update on one step: increase (`reward > 0`) or decrease (`< 0`) the
     /// probability of the token that was produced.
     pub fn update(&mut self, step: &Step, reward: f32) {
-        if reward == 0.0 || step.h.len() != self.n_embd {
+        self.update_scaled(step, reward, 1.0);
+    }
+
+    /// One update with the learning rate multiplied by `scale`.
+    ///
+    /// Stability (learned the hard way: long tool-call trajectories with repeated rewards
+    /// can otherwise diverge): every update element is clipped, `A` entries are bounded,
+    /// rows of `B` keep their initial norm (so `u = B ĥ` stays O(1)), router rows are
+    /// norm-capped, and any update that would produce non-finite values is skipped.
+    fn update_scaled(&mut self, step: &Step, reward: f32, scale: f32) {
+        if reward == 0.0 || !reward.is_finite() || step.h.len() != self.n_embd {
             return;
         }
         let (k, r, e) = (self.cfg.n_experts, self.cfg.rank, self.n_embd);
         let h: Vec<f32> = step.h.iter().map(|&b| half::f16::from_bits(b).to_f32()).collect();
+        if h.iter().any(|v| !v.is_finite()) || step.top.iter().any(|&(_, l)| !l.is_finite()) {
+            return;
+        }
         let hu = Self::unit(&h);
         let (g, u) = self.route(&hu);
         // current policy over the recorded support
@@ -219,7 +235,12 @@ impl CorrectionExperts {
                 dg[kk] += d * z;
             }
         }
-        let lr = self.cfg.lr;
+        if delta.iter().chain(&at_delta).chain(&dg).chain(&u).any(|v| !v.is_finite()) {
+            return;
+        }
+        let lr = self.cfg.lr * scale;
+        const CLIP: f32 = 0.25; // max change of one weight per update
+        const A_MAX: f32 = 4.0;
         // A rows
         for (&(t, _), &d) in step.top.iter().zip(&delta) {
             if d.abs() < 1e-6 {
@@ -229,26 +250,38 @@ impl CorrectionExperts {
             for kk in 0..k {
                 for j in 0..r {
                     let w = &mut row[kk * r + j];
-                    *w = *w * (1.0 - self.cfg.weight_decay) + lr * g[kk] * d * u[kk * r + j];
+                    let step = (lr * g[kk] * d * u[kk * r + j]).clamp(-CLIP, CLIP);
+                    *w = (*w * (1.0 - self.cfg.weight_decay) + step).clamp(-A_MAX, A_MAX);
                 }
             }
         }
         // B
         for kk in 0..k {
             for j in 0..r {
-                let c = lr * 0.1 * g[kk] * at_delta[kk * r + j];
+                let c = (lr * 0.1 * g[kk] * at_delta[kk * r + j]).clamp(-CLIP, CLIP);
                 if c != 0.0 {
                     let bb = &mut self.b[(kk * r + j) * e..(kk * r + j + 1) * e];
+                    let before: f32 = bb.iter().map(|w| w * w).sum::<f32>().sqrt();
                     bb.iter_mut().zip(&hu).for_each(|(w, x)| *w += c * x);
+                    // keep the row norm fixed: the update only rotates the projection
+                    let after: f32 = bb.iter().map(|w| w * w).sum::<f32>().sqrt().max(1e-6);
+                    let f = before / after;
+                    bb.iter_mut().for_each(|w| *w *= f);
                 }
             }
         }
         // router
         let mean: f32 = g.iter().zip(&dg).map(|(a, b)| a * b).sum();
         for kk in 0..k {
-            let c = lr * 0.1 * g[kk] * (dg[kk] - mean);
+            let c = (lr * 0.1 * g[kk] * (dg[kk] - mean)).clamp(-CLIP, CLIP);
             if c != 0.0 {
-                self.wg[kk * e..(kk + 1) * e].iter_mut().zip(&hu).for_each(|(w, x)| *w += c * x);
+                let row = &mut self.wg[kk * e..(kk + 1) * e];
+                row.iter_mut().zip(&hu).for_each(|(w, x)| *w += c * x);
+                let n: f32 = row.iter().map(|w| w * w).sum::<f32>().sqrt();
+                const WG_MAX: f32 = 8.0;
+                if n > WG_MAX {
+                    row.iter_mut().for_each(|w| *w *= WG_MAX / n);
+                }
             }
         }
         self.stats.updates += 1;
@@ -258,9 +291,25 @@ impl CorrectionExperts {
     /// Apply `reward` to every step, `epochs` times (several passes make a single
     /// correction take effect immediately).
     pub fn reinforce(&mut self, steps: &[Step], reward: f32, epochs: usize) {
+        // long trajectories share one reward: scale so the total step is ~ √n, not n
+        let scale = 1.0 / (steps.len().max(1) as f32).sqrt().max(1.0);
+        let scale = scale.max(0.1);
         for _ in 0..epochs.max(1) {
             for s in steps {
-                self.update(s, reward);
+                self.update_scaled(s, reward, scale);
+            }
+        }
+        self.stats.reward_sum += reward as f64;
+        self.stats.reward_count += 1;
+    }
+
+    /// Supervised-style update for a correction: full learning rate on every step (still
+    /// clipped and bounded). Use for short teacher-forced corrections, not for rewards on
+    /// long trajectories.
+    pub fn correct(&mut self, steps: &[Step], reward: f32, epochs: usize) {
+        for _ in 0..epochs.max(1) {
+            for s in steps {
+                self.update_scaled(s, reward, 1.0);
             }
         }
         self.stats.reward_sum += reward as f64;
@@ -333,6 +382,9 @@ impl CorrectionExperts {
             pos += 4;
             a.insert(t, f32s(&mut pos, k * r).into_boxed_slice());
         }
+        if b.iter().chain(&wg).chain(a.values().flat_map(|r| r.iter())).any(|x| !x.is_finite()) {
+            bail!(Format, "adapter file contains non-finite weights (delete it to start fresh)");
+        }
         Ok(CorrectionExperts {
             cfg: AdapterConfig { n_experts: k, rank: r, max_shift, ..cfg },
             n_embd: e,
@@ -377,6 +429,31 @@ mod tests {
         let shift_same = (l[7] - base[7]) - (l[3] - base[3]);
         let shift_other = (l2[7] - base[7]) - (l2[3] - base[3]);
         assert!(shift_same > shift_other.abs(), "{shift_same} vs {shift_other}");
+    }
+
+    #[test]
+    fn long_trajectories_with_repeated_rewards_stay_finite() {
+        // reproduces the tool-harness case that diverged: 300-step tool calls, rewarded
+        // -1 / +1 repeatedly
+        let (e, v) = (256, 400);
+        let mut ex = CorrectionExperts::new(e, v, AdapterConfig::default());
+        let mut r = Rng(42);
+        let steps: Vec<Step> = (0..300)
+            .map(|i| {
+                let h: Vec<f32> = (0..e).map(|_| r.normal() * 3.0).collect();
+                let base: Vec<f32> = (0..v).map(|_| r.normal() * 2.0).collect();
+                Step::new(&h, &base, (i * 7 % v) as u32, 32)
+            })
+            .collect();
+        for round in 0..20 {
+            ex.reinforce(&steps, if round % 3 == 0 { 1.0 } else { -1.0 }, 2);
+        }
+        assert!(ex.a.values().all(|row| row.iter().all(|x| x.is_finite() && x.abs() <= 4.0)));
+        assert!(ex.b.iter().chain(&ex.wg).all(|x| x.is_finite()));
+        let h: Vec<f32> = (0..e).map(|_| r.normal()).collect();
+        let mut l = vec![0.0; v];
+        ex.apply(&h, &mut l);
+        assert!(l.iter().all(|x| x.is_finite() && x.abs() <= 8.0 + 1e-4));
     }
 
     #[test]

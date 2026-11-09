@@ -283,6 +283,7 @@ pub struct ToolCallFilter {
     n_tokens: usize,
     enabled: bool,
     max_string: usize,
+    max_call: usize,
 }
 
 impl ToolCallFilter {
@@ -292,9 +293,14 @@ impl ToolCallFilter {
     }
 
     pub fn with_max_string(format: CallFormat, tools: Vec<ToolSig>, forced: bool, enabled: bool, max_string: usize) -> Self {
+        Self::with_limits(format, tools, forced, enabled, max_string, 16384)
+    }
+
+    /// `max_string`: bytes per free-text string; `max_call`: soft budget for the whole call.
+    pub fn with_limits(format: CallFormat, tools: Vec<ToolSig>, forced: bool, enabled: bool, max_string: usize, max_call: usize) -> Self {
         let tools = Arc::new(tools);
         let json = (forced && enabled && !tools.is_empty())
-            .then(|| JsonConstraint::tool_call(tools.clone(), format.args_key()).with_max_string(max_string));
+            .then(|| JsonConstraint::tool_call(tools.clone(), format.args_key()).with_max_string(max_string).with_max_total(max_call));
         ToolCallFilter {
             format,
             tools,
@@ -307,6 +313,7 @@ impl ToolCallFilter {
             n_tokens: 0,
             enabled,
             max_string,
+            max_call,
         }
     }
 
@@ -314,7 +321,9 @@ impl ToolCallFilter {
         if !self.enabled || self.tools.is_empty() || self.call_json.is_some() {
             return;
         }
-        let mut c = JsonConstraint::tool_call(self.tools.clone(), self.format.args_key()).with_max_string(self.max_string);
+        let mut c = JsonConstraint::tool_call(self.tools.clone(), self.format.args_key())
+            .with_max_string(self.max_string)
+            .with_max_total(self.max_call);
         if c.feed(rest) {
             self.call_start = Some(at);
             self.call_first_token = Some(self.n_tokens);

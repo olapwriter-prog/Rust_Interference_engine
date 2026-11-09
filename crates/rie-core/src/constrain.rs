@@ -134,6 +134,7 @@ const MAX_WS_RUN: u8 = 3;
 const MAX_STRING: usize = 8192;
 const MAX_NUMBER: usize = 32;
 const MAX_DEPTH: usize = 24;
+const MAX_TOTAL: usize = 16384;
 
 /// Incremental JSON validator with tool-call schema awareness. See the module docs.
 #[derive(Debug, Clone)]
@@ -152,6 +153,9 @@ pub struct JsonConstraint {
     /// key whose value is being parsed (set at the colon)
     pending_key: Option<u16>,
     max_string: usize,
+    /// bytes consumed so far and the soft budget after which the output winds down
+    consumed: usize,
+    max_total: usize,
 }
 
 impl JsonConstraint {
@@ -170,6 +174,8 @@ impl JsonConstraint {
             chosen: None,
             pending_key: None,
             max_string: MAX_STRING,
+            consumed: 0,
+            max_total: MAX_TOTAL,
         }
     }
 
@@ -187,6 +193,8 @@ impl JsonConstraint {
             chosen: None,
             pending_key: None,
             max_string: MAX_STRING,
+            consumed: 0,
+            max_total: MAX_TOTAL,
         }
     }
 
@@ -195,6 +203,35 @@ impl JsonConstraint {
     pub fn with_max_string(mut self, n: usize) -> Self {
         self.max_string = n.max(1);
         self
+    }
+
+    /// Soft budget for the whole object. Once it is used up the output *winds down*: free
+    /// strings must close, no new keys or array items are opened (except still-missing
+    /// required arguments), nested containers close and scalars finish, so a model that
+    /// keeps adding content still ends with a complete, valid object.
+    pub fn with_max_total(mut self, n: usize) -> Self {
+        self.max_total = n.max(16);
+        self
+    }
+
+    fn winding(&self) -> bool {
+        self.consumed > self.max_total
+    }
+
+    /// Required arguments of the innermost `Args` object that are still missing.
+    fn missing_required(&self, schema: Schema, seen: &[u16]) -> Vec<Vec<u8>> {
+        match schema {
+            Schema::Args(i) => {
+                let t = &self.tools[i];
+                t.args
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, (n, _))| t.required.contains(n) && !seen.contains(&(*k as u16)))
+                    .map(|(_, (n, _))| n.as_bytes().to_vec())
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// The root object has been closed.
@@ -297,13 +334,16 @@ impl JsonConstraint {
     }
 
     fn step(&mut self, b: u8) -> bool {
+        self.consumed += 1;
+        let winding = self.winding();
         // ---- inside a lexeme ----
         match &mut self.lex {
             Lex::Str { is_key, esc, uni, len, buf, allowed } => {
                 *len += 1;
                 // at the length cap only the closing quote is allowed (never a dead end)
-                // (applies to free-text values only, not to keys or enum values)
-                let capped = !*is_key && allowed.is_none() && *len > self.max_string;
+                // free text = any string that is not restricted to an enum (values and the keys
+                // of free-form objects); enum strings are bounded by their allowed values
+                let capped = allowed.is_none() && (*len > self.max_string || winding);
                 if (capped || *len > MAX_STRING) && (b != b'"' || *esc || *uni > 0) {
                     return false;
                 }
@@ -448,7 +488,15 @@ impl JsonConstraint {
         match top {
             Frame::Obj { st, schema, seen, .. } => match (st, b) {
                 (ObjSt::KeyOrEnd | ObjSt::Key, b'"') => {
-                    let allowed = self.keys_for(schema, &seen);
+                    let mut allowed = self.keys_for(schema, &seen);
+                    if self.winding() && schema != Schema::ToolRoot {
+                        let missing = self.missing_required(schema, &seen);
+                        if !missing.is_empty() {
+                            allowed = missing;
+                        } else if st == ObjSt::KeyOrEnd {
+                            return false; // close instead of opening a new key
+                        }
+                    }
                     let allowed = if schema == Schema::Any { None } else { Some(Arc::new(allowed)) };
                     if let Some(a) = &allowed {
                         if a.is_empty() {
@@ -474,6 +522,9 @@ impl JsonConstraint {
                     if schema != Schema::Any && self.keys_for(schema, &seen).is_empty() {
                         return false;
                     }
+                    if self.winding() && schema != Schema::ToolRoot && self.can_close(schema, &seen) {
+                        return false;
+                    }
                     self.set_obj_state(ObjSt::Key);
                     true
                 }
@@ -489,6 +540,9 @@ impl JsonConstraint {
                     false
                 }
                 (ArrSt::CommaOrEnd, b',') => {
+                    if self.winding() {
+                        return false;
+                    }
                     if let Some(Frame::Arr { st }) = self.frames.last_mut() {
                         *st = ArrSt::Value;
                     }
@@ -511,7 +565,9 @@ impl JsonConstraint {
 
     fn start_value(&mut self, b: u8) -> bool {
         let (ty, allowed, child) = self.value_rule();
-        let ok_type = |t: ArgType| ty == ArgType::Any || ty == t;
+        // when winding down, untyped values must be scalars (no new containers)
+        let winding = self.winding();
+        let ok_type = |t: ArgType| (ty == ArgType::Any && !(winding && matches!(t, ArgType::Object | ArgType::Array))) || ty == t;
         match b {
             b'"' if ok_type(ArgType::String) => {
                 self.lex = Lex::Str { is_key: false, esc: false, uni: 0, len: 0, buf: Vec::new(), allowed };
@@ -672,6 +728,35 @@ mod tests {
         assert!(c.feed(br#"{"name": "browser.open", "arguments": {"url": "abcd"#));
         assert!(!c.accepts(b"e"), "over the cap");
         assert!(c.accepts(b"\""), "closing quote must stay possible");
+    }
+
+    #[test]
+    fn budget_winds_down_to_a_complete_object() {
+        // a "model" that always prefers to keep the object growing still ends up complete
+        let tools = Arc::new(vec![ToolSig {
+            name: "use_tool".into(),
+            args: vec![("name".into(), ArgType::String), ("arguments".into(), ArgType::Object)],
+            required: vec!["name".into(), "arguments".into()],
+            enums: vec![],
+        }]);
+        let mut c = JsonConstraint::tool_call(tools, "arguments").with_max_total(80).with_max_string(16);
+        let prefs: &[&[u8]] = &[b"{", b"[", b"\"k", b"\"", b":", b",", b"1", b"x", b"]", b"}", b"name", b"arguments", b"use_tool"];
+        let mut out = Vec::new();
+        for _ in 0..2000 {
+            if c.is_complete() {
+                break;
+            }
+            let pick = if out.is_empty() {
+                Some(&b"{\"name\": \"use_tool\", \"arguments\": "[..])
+            } else {
+                prefs.iter().copied().find(|p| c.accepts(p))
+            };
+            let p = pick.unwrap_or_else(|| panic!("dead end after {:?}", String::from_utf8_lossy(&out)));
+            assert!(c.feed(p));
+            out.extend_from_slice(p);
+        }
+        assert!(c.is_complete(), "did not finish: {}", String::from_utf8_lossy(&out));
+        assert!(out.len() < 400, "{}", String::from_utf8_lossy(&out));
     }
 
     #[test]

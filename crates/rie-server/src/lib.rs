@@ -57,6 +57,11 @@ pub struct ServerConfig {
     pub success_reward: f32,
     /// Maximum bytes of one string value inside a constrained tool call / JSON reply.
     pub max_string: usize,
+    /// Treat `tool_choice: "auto"` (or absent) as "required" when tools are offered.
+    /// For very small models that never decide to call a tool on their own (and tests).
+    pub force_tools: bool,
+    /// Soft byte budget for one constrained tool call / JSON reply (then it winds down).
+    pub max_call: usize,
 }
 
 impl Default for ServerConfig {
@@ -79,6 +84,8 @@ impl Default for ServerConfig {
             rl_cfg: AdapterConfig::default(),
             success_reward: 0.3,
             max_string: 4096,
+            force_tools: false,
+            max_call: 16384,
         }
     }
 }
@@ -478,6 +485,7 @@ fn chat(body: &Value, w: &mut TcpStream, state: &Arc<Mutex<State>>) -> std::io::
     let use_tools = use_tools && !sigs.is_empty();
 
     let mut st = lock(state);
+    let forced = forced || (use_tools && st.cfg.force_tools);
     st.auto_reward(&msgs);
     let template = st.engine.template;
     let format = CallFormat::for_template(template);
@@ -501,14 +509,15 @@ fn chat(body: &Value, w: &mut TcpStream, state: &Arc<Mutex<State>>) -> std::io::
     let id = st.next_id("chatcmpl-");
     let model = st.alias.clone();
     let created = now();
-    let mut filter = ToolCallFilter::with_max_string(
+    let mut filter = ToolCallFilter::with_limits(
         format,
         if use_tools { sigs.clone() } else { Vec::new() },
         forced,
         st.cfg.constrain && use_tools,
         st.cfg.max_string,
+        st.cfg.max_call,
     );
-    let mut json_filter = JsonModeFilter::new(json_mode && !use_tools, st.cfg.max_string);
+    let mut json_filter = JsonModeFilter::new(json_mode && !use_tools, st.cfg.max_string, st.cfg.max_call);
 
     if stream {
         http::start_sse(w)?;
@@ -544,6 +553,21 @@ fn chat(body: &Value, w: &mut TcpStream, state: &Arc<Mutex<State>>) -> std::io::
             st.engine.generate_hooked(&tokens, &params, &mut filter, &mut on_text)
         }
     };
+    if let Ok(path) = std::env::var("RIE_SERVER_LOG") {
+        // debugging aid: request summary + what was generated
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let req = json!({"tool_choice": body.get("tool_choice"), "n_tools": sigs.len(), "max_tokens": params.max_tokens, "stop": params.stop_strings,
+                "temperature": body.get("temperature"), "n_messages": msgs.len(), "forced": forced, "prompt_tokens": tokens.len()});
+            let out = match &res {
+                Ok(s) => {
+                    json!({"stop": format!("{:?}", s.stop), "generated": s.generated_tokens, "text": String::from_utf8_lossy(&filter.raw).chars().take(300).collect::<String>()})
+                }
+                Err(e) => json!({"error": e.to_string()}),
+            };
+            let _ = writeln!(f, "{}", json!({"request": req, "result": out}));
+        }
+    }
     let stats = match res {
         Ok(s) => s,
         Err(e) => {
@@ -709,8 +733,8 @@ fn correction(st: &mut State, body: &Value) -> Result<Value, String> {
             None => &[],
         };
         for _ in 0..epochs {
-            adapter.reinforce(bad, -1.0, 1);
-            adapter.reinforce(&good, 1.0, 1);
+            adapter.correct(bad, -1.0, 1);
+            adapter.correct(&good, 1.0, 1);
         }
         rec.rewarded = true;
     }
@@ -724,8 +748,11 @@ struct JsonModeFilter {
 }
 
 impl JsonModeFilter {
-    fn new(enabled: bool, max_string: usize) -> Self {
-        JsonModeFilter { enabled, c: rie_core::constrain::JsonConstraint::any_object().with_max_string(max_string) }
+    fn new(enabled: bool, max_string: usize, max_call: usize) -> Self {
+        JsonModeFilter {
+            enabled,
+            c: rie_core::constrain::JsonConstraint::any_object().with_max_string(max_string).with_max_total(max_call),
+        }
     }
 }
 
@@ -787,6 +814,8 @@ pub fn parse_args(args: &[String]) -> Result<ServerConfig, String> {
             "--experts" => c.rl_cfg.n_experts = val(&mut i)?.parse().map_err(|_| "bad --experts")?,
             "--rank" => c.rl_cfg.rank = val(&mut i)?.parse().map_err(|_| "bad --rank")?,
             "--no-constrain" => c.constrain = false,
+            "--max-call" => c.max_call = val(&mut i)?.parse().map_err(|_| "bad --max-call")?,
+            "--tool-choice" => c.force_tools = val(&mut i)? == "required",
             "--max-string" => c.max_string = val(&mut i)?.parse().map_err(|_| "bad --max-string")?,
             // llama.cpp flags that do not apply here (accepted so harnesses can launch us unchanged)
             "--fit" | "-fa" | "--flash-attn" => {
@@ -854,6 +883,8 @@ usage: rie-server -m MODEL.gguf [options]
       --mlock             lock weights in RAM
       --no-constrain      do not grammar-constrain tool calls
       --max-string N      max bytes per string value in a constrained call (default 4096)
+      --max-call N        soft byte budget per tool call, then wound down to a valid end (default 16384)
+      --tool-choice required  force a tool call whenever tools are offered with tool_choice auto
 
 online learning (reinforcement learning from feedback):
       --rl                enable correction experts (in memory)
