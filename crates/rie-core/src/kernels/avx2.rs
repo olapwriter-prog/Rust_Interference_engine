@@ -248,3 +248,84 @@ pub unsafe fn f32_to_f16(src: &[f32], dst: &mut [u16]) {
         i += 1;
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// 4-token kernels (prompt processing): unpack each weight block once.
+// ---------------------------------------------------------------------------------------
+
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn dot4_q8_0(w: &[u8], a: [&[BlockQ8_0]; 4]) -> [f32; 4] {
+    let mut acc = [_mm256_setzero_ps(); 4];
+    for i in 0..a[0].len() {
+        let b = w.as_ptr().add(i * 34);
+        let x = _mm256_loadu_si256(b.add(2) as *const __m256i);
+        let ax = _mm256_sign_epi8(x, x);
+        let d = ld_f16(b);
+        for t in 0..4 {
+            let ab = a[t].get_unchecked(i);
+            let y = _mm256_loadu_si256(ab.qs.as_ptr() as *const __m256i);
+            let dot = _mm256_maddubs_epi16(ax, _mm256_sign_epi8(y, x));
+            let s = _mm256_cvtepi32_ps(_mm256_madd_epi16(dot, _mm256_set1_epi16(1)));
+            acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * ab.d), s, acc[t]);
+        }
+    }
+    [hsum_ps(acc[0]), hsum_ps(acc[1]), hsum_ps(acc[2]), hsum_ps(acc[3])]
+}
+
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn dot4_q4_0(w: &[u8], a: [&[BlockQ8_0]; 4]) -> [f32; 4] {
+    let m4 = _mm256_set1_epi8(0x0F);
+    let off = _mm256_set1_epi8(8);
+    let mut acc = [_mm256_setzero_ps(); 4];
+    for i in 0..a[0].len() {
+        let b = w.as_ptr().add(i * 18);
+        let q = _mm_loadu_si128(b.add(2) as *const __m128i);
+        let x = _mm256_sub_epi8(_mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(q, 4), q), m4), off);
+        let ax = _mm256_sign_epi8(x, x);
+        let d = ld_f16(b);
+        for t in 0..4 {
+            let ab = a[t].get_unchecked(i);
+            let y = _mm256_loadu_si256(ab.qs.as_ptr() as *const __m256i);
+            let dot = _mm256_maddubs_epi16(ax, _mm256_sign_epi8(y, x));
+            let s = _mm256_cvtepi32_ps(_mm256_madd_epi16(dot, _mm256_set1_epi16(1)));
+            acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * ab.d), s, acc[t]);
+        }
+    }
+    [hsum_ps(acc[0]), hsum_ps(acc[1]), hsum_ps(acc[2]), hsum_ps(acc[3])]
+}
+
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn dot4_q4_k(w: &[u8], a: [&[BlockQ8K]; 4]) -> [f32; 4] {
+    let m4 = _mm256_set1_epi8(0x0F);
+    let mut out = [0.0f32; 4];
+    for i in 0..a[0].len() {
+        let b = w.as_ptr().add(i * 144);
+        let d = ld_f16(b);
+        let dmin = ld_f16(b.add(2));
+        let (sc, mn) = unpack_k4_scales(std::slice::from_raw_parts(b.add(4), 12));
+        let q = b.add(16);
+        let mut acc = [_mm256_setzero_si256(); 4];
+        for j in 0..4 {
+            let v = _mm256_loadu_si256(q.add(32 * j) as *const __m256i);
+            let lo = _mm256_and_si256(v, m4);
+            let hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), m4);
+            let s_lo = _mm256_set1_epi16(sc[2 * j] as i16);
+            let s_hi = _mm256_set1_epi16(sc[2 * j + 1] as i16);
+            for t in 0..4 {
+                let aq = a[t].get_unchecked(i).qs.as_ptr().add(64 * j);
+                let plo = _mm256_madd_epi16(_mm256_maddubs_epi16(lo, _mm256_loadu_si256(aq as *const __m256i)), s_lo);
+                let phi = _mm256_madd_epi16(_mm256_maddubs_epi16(hi, _mm256_loadu_si256(aq.add(32) as *const __m256i)), s_hi);
+                acc[t] = _mm256_add_epi32(acc[t], _mm256_add_epi32(plo, phi));
+            }
+        }
+        for t in 0..4 {
+            let ab = a[t].get_unchecked(i);
+            let mut summ = 0i32;
+            for j in 0..8 {
+                summ += (ab.bsums[2 * j] as i32 + ab.bsums[2 * j + 1] as i32) * mn[j] as i32;
+            }
+            out[t] += d * ab.d * hsum_epi32(acc[t]) as f32 - dmin * ab.d * summ as f32;
+        }
+    }
+    out
+}

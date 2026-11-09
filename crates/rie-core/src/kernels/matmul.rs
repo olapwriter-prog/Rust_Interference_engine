@@ -9,7 +9,7 @@
 //! * During prompt processing every weight row is loaded once and reused for all tokens
 //!   of the batch (and with `SMMLA` 2×2 register tiles on i8mm CPUs).
 
-use super::{has_mmla, mmla_2x2, vec_dot, ActRow};
+use super::{has_mmla, has_x4, mmla_2x2, vec_dot, vec_dot_x4, ActRow};
 use crate::quant::{quantize_row_q8_k, ActFormat, BlockQ8K, BlockQ8_0, QK, QK_K};
 use crate::tensor::Weight;
 use crate::threadpool::ThreadPool;
@@ -207,6 +207,27 @@ fn compute_rows(w: &Weight, acts: &QuantActs, r0: usize, r1: usize, out: SyncPtr
             }
             r += 2;
         }
+    }
+    // 4-token register tiles: unpack each weight block once for four activation rows.
+    if n_tok >= 4 && has_x4(w.ty) {
+        while r < r1 {
+            let wr = w.row(r);
+            let mut t = 0;
+            while t + 4 <= n_tok {
+                let a = [acts.row(fmt, t), acts.row(fmt, t + 1), acts.row(fmt, t + 2), acts.row(fmt, t + 3)];
+                let res = vec_dot_x4(w.ty, wr, a).unwrap();
+                for (k, v) in res.into_iter().enumerate() {
+                    unsafe { *out.add((t + k) * ld + r) = v };
+                }
+                t += 4;
+            }
+            for t in t..n_tok {
+                let v = vec_dot(w.ty, wr, acts.row(fmt, t), k);
+                unsafe { *out.add(t * ld + r) = v };
+            }
+            r += 1;
+        }
+        return;
     }
     // Generic path: each weight row stays hot in L1 while it is dotted with all tokens.
     while r < r1 {

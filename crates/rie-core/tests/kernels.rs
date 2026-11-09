@@ -153,7 +153,7 @@ fn parallel_matmul_matches_naive_for_batches() {
     let (rows, k) = (200usize, 512usize);
     for &ty in &[GgmlType::Q4_0, GgmlType::Q8_0, GgmlType::Q4_K, GgmlType::Q6_K, GgmlType::F16, GgmlType::Q5_0] {
         let w = Weight::owned(ty, rows, k, random_weight(&mut rng, ty, rows, k));
-        for &n_tok in &[1usize, 2, 3, 8] {
+        for &n_tok in &[1usize, 2, 3, 4, 7, 8] {
             let x = rng.vec(n_tok * k, 1.0);
             let mut acts = QuantActs::new();
             acts.prepare(&pool, &x, n_tok, k, &formats_for(&[&w]));

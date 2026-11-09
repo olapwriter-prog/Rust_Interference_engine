@@ -613,3 +613,159 @@ pub unsafe fn f32_to_f16(src: &[f32], dst: &mut [u16]) {
         i += 1;
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// 4-token kernels for prompt processing on dotprod (non-i8mm) CPUs: each weight block is
+// loaded and unpacked once and dotted with four activation rows.
+// ---------------------------------------------------------------------------------------
+
+macro_rules! gen_x4 {
+    ($($name:ident ($b:ty));* $(;)?) => {
+        $(
+            #[target_feature(enable = "neon,dotprod")]
+            pub unsafe fn $name(w: &[u8], a: [&[$b]; 4]) -> [f32; 4] { x4::$name::<Sdot>(w, a) }
+        )*
+        pub mod x4_neon {
+            use super::*;
+            $(
+                #[target_feature(enable = "neon")]
+                pub unsafe fn $name(w: &[u8], a: [&[$b]; 4]) -> [f32; 4] { super::x4::$name::<Mull>(w, a) }
+            )*
+        }
+    };
+}
+
+gen_x4! {
+    dot4_q8_0(BlockQ8_0);
+    dot4_q4_0(BlockQ8_0);
+    dot4_q4_k(BlockQ8K);
+    dot4_q6_k(BlockQ8K);
+}
+
+mod x4 {
+    use super::*;
+
+    #[inline(always)]
+    pub unsafe fn dot4_q8_0<D: I8Dot>(w: &[u8], a: [&[BlockQ8_0]; 4]) -> [f32; 4] {
+        let nb = a[0].len();
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        for i in 0..nb {
+            let b = w.as_ptr().add(i * 34);
+            let x0 = vld1q_s8(b.add(2) as *const i8);
+            let x1 = vld1q_s8(b.add(18) as *const i8);
+            let d = ld_f16(b);
+            for t in 0..4 {
+                let ab = a[t].get_unchecked(i);
+                let p = D::dot(D::dot(vdupq_n_s32(0), x0, vld1q_s8(ab.qs.as_ptr())), x1, vld1q_s8(ab.qs.as_ptr().add(16)));
+                acc[t] = vmlaq_n_f32(acc[t], vcvtq_f32_s32(p), d * ab.d);
+            }
+        }
+        [vaddvq_f32(acc[0]), vaddvq_f32(acc[1]), vaddvq_f32(acc[2]), vaddvq_f32(acc[3])]
+    }
+
+    #[inline(always)]
+    pub unsafe fn dot4_q4_0<D: I8Dot>(w: &[u8], a: [&[BlockQ8_0]; 4]) -> [f32; 4] {
+        let nb = a[0].len();
+        let m4 = vdupq_n_u8(0xF);
+        let s8 = vdupq_n_s8(8);
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        for i in 0..nb {
+            let b = w.as_ptr().add(i * 18);
+            let v = vld1q_u8(b.add(2));
+            let x0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v, m4)), s8);
+            let x1 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v, 4)), s8);
+            let d = ld_f16(b);
+            for t in 0..4 {
+                let ab = a[t].get_unchecked(i);
+                let p = D::dot(D::dot(vdupq_n_s32(0), x0, vld1q_s8(ab.qs.as_ptr())), x1, vld1q_s8(ab.qs.as_ptr().add(16)));
+                acc[t] = vmlaq_n_f32(acc[t], vcvtq_f32_s32(p), d * ab.d);
+            }
+        }
+        [vaddvq_f32(acc[0]), vaddvq_f32(acc[1]), vaddvq_f32(acc[2]), vaddvq_f32(acc[3])]
+    }
+
+    #[inline(always)]
+    pub unsafe fn dot4_q4_k<D: I8Dot>(w: &[u8], a: [&[BlockQ8K]; 4]) -> [f32; 4] {
+        let nb = a[0].len();
+        let m4 = vdupq_n_u8(0xF);
+        let mut out = [0.0f32; 4];
+        for i in 0..nb {
+            let b = w.as_ptr().add(i * 144);
+            let d = ld_f16(b);
+            let dmin = ld_f16(b.add(2));
+            let (sc, mn) = unpack_k4_scales(std::slice::from_raw_parts(b.add(4), 12));
+            let q = b.add(16);
+            let mut sumi = [0i32; 4];
+            for j in 0..4 {
+                let q0 = vld1q_u8(q.add(32 * j));
+                let q1 = vld1q_u8(q.add(32 * j + 16));
+                let l0 = vreinterpretq_s8_u8(vandq_u8(q0, m4));
+                let l1 = vreinterpretq_s8_u8(vandq_u8(q1, m4));
+                let h0 = vreinterpretq_s8_u8(vshrq_n_u8(q0, 4));
+                let h1 = vreinterpretq_s8_u8(vshrq_n_u8(q1, 4));
+                for t in 0..4 {
+                    let aq = a[t].get_unchecked(i).qs.as_ptr().add(64 * j);
+                    let p1 = D::dot(D::dot(vdupq_n_s32(0), l0, vld1q_s8(aq)), l1, vld1q_s8(aq.add(16)));
+                    let p2 = D::dot(D::dot(vdupq_n_s32(0), h0, vld1q_s8(aq.add(32))), h1, vld1q_s8(aq.add(48)));
+                    sumi[t] += vaddvq_s32(p1) * sc[2 * j] as i32 + vaddvq_s32(p2) * sc[2 * j + 1] as i32;
+                }
+            }
+            for t in 0..4 {
+                let ab = a[t].get_unchecked(i);
+                let mut summ = 0i32;
+                for j in 0..8 {
+                    summ += (ab.bsums[2 * j] as i32 + ab.bsums[2 * j + 1] as i32) * mn[j] as i32;
+                }
+                out[t] += d * ab.d * sumi[t] as f32 - dmin * ab.d * summ as f32;
+            }
+        }
+        out
+    }
+
+    #[inline(always)]
+    pub unsafe fn dot4_q6_k<D: I8Dot>(w: &[u8], a: [&[BlockQ8K]; 4]) -> [f32; 4] {
+        let nb = a[0].len();
+        let m4 = vdupq_n_u8(0xF);
+        let m3 = vdupq_n_u8(3);
+        let s32 = vdupq_n_s8(32);
+        let mut out = [0.0f32; 4];
+        for i in 0..nb {
+            let b = w.as_ptr().add(i * 210);
+            let d = ld_f16(b.add(208));
+            let sc = b.add(192) as *const i8;
+            let mut sumi = [0i32; 4];
+            for n in 0..2 {
+                let ql = b.add(64 * n);
+                let qh = b.add(128 + 32 * n);
+                let qh0 = vld1q_u8(qh);
+                let qh1 = vld1q_u8(qh.add(16));
+                let ql0 = vld1q_u8(ql);
+                let ql1 = vld1q_u8(ql.add(16));
+                let ql2 = vld1q_u8(ql.add(32));
+                let ql3 = vld1q_u8(ql.add(48));
+                let mk = |lo: uint8x16_t, hi: uint8x16_t| vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(lo, vshlq_n_u8(hi, 4))), s32);
+                let v = [
+                    mk(vandq_u8(ql0, m4), vandq_u8(qh0, m3)),
+                    mk(vandq_u8(ql1, m4), vandq_u8(qh1, m3)),
+                    mk(vandq_u8(ql2, m4), vandq_u8(vshrq_n_u8(qh0, 2), m3)),
+                    mk(vandq_u8(ql3, m4), vandq_u8(vshrq_n_u8(qh1, 2), m3)),
+                    mk(vshrq_n_u8(ql0, 4), vandq_u8(vshrq_n_u8(qh0, 4), m3)),
+                    mk(vshrq_n_u8(ql1, 4), vandq_u8(vshrq_n_u8(qh1, 4), m3)),
+                    mk(vshrq_n_u8(ql2, 4), vshrq_n_u8(qh0, 6)),
+                    mk(vshrq_n_u8(ql3, 4), vshrq_n_u8(qh1, 6)),
+                ];
+                for t in 0..4 {
+                    let aq = a[t].get_unchecked(i).qs.as_ptr().add(128 * n);
+                    for (k, vk) in v.iter().enumerate() {
+                        let p = D::dot(vdupq_n_s32(0), *vk, vld1q_s8(aq.add(16 * k)));
+                        sumi[t] += vaddvq_s32(p) * (*sc.add(8 * n + k)) as i32;
+                    }
+                }
+            }
+            for t in 0..4 {
+                out[t] += d * a[t].get_unchecked(i).d * sumi[t] as f32;
+            }
+        }
+        out
+    }
+}

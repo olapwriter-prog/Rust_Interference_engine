@@ -231,6 +231,70 @@ pub fn vec_dot(ty: GgmlType, w: &[u8], a: ActRow<'_>, n: usize) -> f32 {
     }
 }
 
+/// One weight row dotted with four activation rows (prompt processing). Returns `None`
+/// when no 4-token kernel exists for this type on this CPU.
+#[inline]
+#[allow(unused_variables)]
+pub(crate) fn vec_dot_x4(ty: GgmlType, w: &[u8], a: [ActRow<'_>; 4]) -> Option<[f32; 4]> {
+    let f = CpuFeatures::get();
+    macro_rules! q8_0 {
+        () => {
+            match a {
+                [ActRow::Q8_0(a0), ActRow::Q8_0(a1), ActRow::Q8_0(a2), ActRow::Q8_0(a3)] => [a0, a1, a2, a3],
+                _ => return None,
+            }
+        };
+    }
+    macro_rules! q8k {
+        () => {
+            match a {
+                [ActRow::Q8K(a0), ActRow::Q8K(a1), ActRow::Q8K(a2), ActRow::Q8K(a3)] => [a0, a1, a2, a3],
+                _ => return None,
+            }
+        };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if f.neon {
+        return unsafe {
+            match (ty, f.dotprod) {
+                (GgmlType::Q8_0, true) => Some(neon::dot4_q8_0(w, q8_0!())),
+                (GgmlType::Q8_0, false) => Some(neon::x4_neon::dot4_q8_0(w, q8_0!())),
+                (GgmlType::Q4_0, true) => Some(neon::dot4_q4_0(w, q8_0!())),
+                (GgmlType::Q4_0, false) => Some(neon::x4_neon::dot4_q4_0(w, q8_0!())),
+                (GgmlType::Q4_K, true) => Some(neon::dot4_q4_k(w, q8k!())),
+                (GgmlType::Q4_K, false) => Some(neon::x4_neon::dot4_q4_k(w, q8k!())),
+                (GgmlType::Q6_K, true) => Some(neon::dot4_q6_k(w, q8k!())),
+                (GgmlType::Q6_K, false) => Some(neon::x4_neon::dot4_q6_k(w, q8k!())),
+                _ => None,
+            }
+        };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if f.x86_simd() {
+        return unsafe {
+            match ty {
+                GgmlType::Q8_0 => Some(avx2::dot4_q8_0(w, q8_0!())),
+                GgmlType::Q4_0 => Some(avx2::dot4_q4_0(w, q8_0!())),
+                GgmlType::Q4_K => Some(avx2::dot4_q4_k(w, q8k!())),
+                _ => None,
+            }
+        };
+    }
+    None
+}
+
+#[inline]
+pub(crate) fn has_x4(ty: GgmlType) -> bool {
+    let f = CpuFeatures::get();
+    if cfg!(target_arch = "aarch64") && f.neon {
+        matches!(ty, GgmlType::Q8_0 | GgmlType::Q4_0 | GgmlType::Q4_K | GgmlType::Q6_K)
+    } else if cfg!(target_arch = "x86_64") && f.x86_simd() {
+        matches!(ty, GgmlType::Q8_0 | GgmlType::Q4_0 | GgmlType::Q4_K)
+    } else {
+        false
+    }
+}
+
 /// 2x2 tile: two weight rows × two activation rows using `SMMLA`, returning
 /// `[w0·a0, w0·a1, w1·a0, w1·a1]`. Only for Q4_0 / Q8_0 on i8mm hardware.
 #[inline]
