@@ -51,9 +51,9 @@ impl Bpe {
         let pats: Vec<&str> = match pre {
             "llama3" | "llama-bpe" | "llama-v3" | "smaug-bpe" | "falcon3" | "pixtral" => vec![LLAMA3],
             "qwen2" | "deepseek-r1-qwen" | "megrez" | "hunyuan" => vec![QWEN2],
-            "smollm" | "starcoder" | "refact" | "codeshell" | "exaone" | "minerva-7b" => vec![DIGITS, GPT2],
+            "smollm" | "starcoder" | "refact" | "codeshell" | "exaone" | "minerva-7b" | "command-r" => vec![DIGITS, GPT2],
             "gpt-4o" | "llama4" | "kimi-k2" => vec![GPT4O],
-            "gpt2" | "default" | "olmo" | "jais" | "stablelm2" | "mpt" | "phi-2" | "granite" => vec![GPT2],
+            "gpt2" | "gpt-2" | "default" | "olmo" | "jais" | "stablelm2" | "mpt" | "phi-2" | "granite" => vec![GPT2],
             _ => vec![LLAMA3],
         };
         let regexes = pats
