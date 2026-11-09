@@ -54,6 +54,58 @@ router:
       extra_args: [--auto-reward, --adapter, ~/.stitap/fast.riea]
 ```
 
+## Memory and tool knowledge
+
+```bash
+./target/release/rie-server -m model.gguf --memory ~/.stitap/rie-memory --tool-recall 8 \
+    --auto-reward --adapter ~/.stitap/rie-memory/adapter.riea
+```
+
+With `--memory DIR`:
+
+* **Observations.** Each request (the latest user message), each action (the tool call or
+  answer the model produced) and each tool result (with success or failure) is appended
+  to `DIR/observations.rmem`. That file is a compact binary journal with a checksum per
+  record, so a write torn by a crash is cut off on load. Conversations are resent in full
+  with every request, so items already recorded are skipped.
+* **Recall.** A 4-bit TurboQuant index of hashed text features (132 bytes per
+  observation) finds the observations relevant to the new request. The best `--recall N`
+  (default 3) are added to the end of the latest user or tool message inside a
+  `<context>` block. The prefix stays unchanged, so prompt caching keeps working.
+* **`recall_memory` tool.** When tools are offered, the model also gets this tool. The
+  server runs it itself and continues generating with the result. The client never sees
+  the call, only the final answer or tool call. Use `--no-memory-tool` to turn it off.
+* **Forgetting.** When more than `--memory-size` (default 20000) observations are stored,
+  the weakest 10% are dropped and the journal is compacted. *Retention* = importance,
+  decayed with a 14-day half-life, plus a boost for every recall. Failures start with
+  higher importance than routine successes, because they are the lessons.
+* **Tool book.** Tool definitions are harvested from every request (`DIR/tools.json`).
+  Each tool result is attributed to the call that produced it, by `tool_call_id`. The
+  server learns:
+  * success and failure counts;
+  * distinct error messages (the tool's limitations);
+  * argument sets that worked (what the tool expects).
+
+  Every tool gets a Markdown card, `DIR/tools/NAME.md`. Text written under its `## Notes`
+  heading is kept and shown to the model. For the offered tools, learned notes are added to
+  the context. For example: `` `weather.get`: 1 calls, 1 failed. Known failures: "Error:
+  invalid argument unit: use c or f". ``
+* **Tool recall** (`--tool-recall K`). When a request offers more than K tools, only the K
+  most relevant to it (plus the tools already used in the conversation) are put in the
+  prompt. This saves context on phones when a harness sends dozens of tools.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /v1/memory` | Markdown journal, newest first (`?n=` limits it) |
+| `GET /v1/memory?q=...&k=5` | search, JSON |
+| `POST /v1/memory {"text": "...", "importance": 0.9}` | add a note (`kind`: note, user, action, result) |
+| `GET /v1/tools` | harvested tools and their statistics |
+| `GET /v1/tools/NAME` | a tool's card (Markdown) |
+
+The text embedding is lexical (words, word pairs and character trigrams, hashed). It
+matches tool names, paths, error messages and keywords well, but not paraphrases with no
+words in common.
+
 ## Teaching it explicitly
 
 Every response carries an `id` (`chatcmpl-…`). The server keeps the last 16 completions.

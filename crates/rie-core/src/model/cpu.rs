@@ -1,4 +1,4 @@
-//! CPU backend: batched transformer forward pass with an f16 KV cache.
+//! CPU backend: batched transformer forward pass with an f16, Q8_0 or TurboQuant-4 KV cache.
 
 use super::{Activation, Backend, DenseFfn, Ffn, Model, MoeFfn};
 use crate::error::{bail, Result};
@@ -18,6 +18,10 @@ pub enum KvType {
     /// ggml Q8_0 blocks (1.06 bytes / value): ~47% less memory, slightly lower precision.
     /// Attention scores then use the int8 dot-product kernels.
     Q8_0,
+    /// TurboQuant 4-bit (random rotation + Lloyd–Max codes, one f16 scale per rotation
+    /// block): ≈4.1 bits / value for head size 128 — 3.9× smaller than f16, 2× smaller
+    /// than Q8_0. Attention runs in the rotated domain without dequantizing the cache.
+    Turbo4,
 }
 
 impl KvType {
@@ -25,6 +29,7 @@ impl KvType {
         match s.to_ascii_lowercase().as_str() {
             "f16" => Some(KvType::F16),
             "q8" | "q8_0" => Some(KvType::Q8_0),
+            "turbo4" | "tq4" | "turbo" => Some(KvType::Turbo4),
             _ => None,
         }
     }
@@ -40,6 +45,8 @@ struct LayerCache {
     vq: Vec<u8>,
     slots: usize,
     ty: KvType,
+    /// rotation of the TurboQuant cache
+    rot: Option<crate::turbo::Rotation>,
 }
 
 pub struct CpuBackend {
@@ -69,6 +76,10 @@ pub struct CpuBackend {
     moe: MoeScratch,
     /// rows of `xn` holding the final hidden states of the last forward
     hidden_rows: usize,
+    /// layer streaming (see [`CpuBackend::set_streaming`])
+    stream: bool,
+    /// per-layer feed-forward inputs, recorded for calibration (see [`CpuBackend::capture_ffn_inputs`])
+    ffn_capture: Option<Vec<Vec<f32>>>,
 }
 
 /// Scratch buffers for mixture-of-experts layers.
@@ -89,7 +100,12 @@ impl CpuBackend {
     pub fn with_kv_type(model: Arc<Model>, pool: Arc<ThreadPool>, n_ctx: usize, max_batch: usize, kv: KvType) -> Self {
         let c = &model.cfg;
         let max_batch = max_batch.clamp(1, n_ctx.max(1));
-        let kv = if kv == KvType::Q8_0 && c.head_dim % QK != 0 { KvType::F16 } else { kv };
+        let kv = match kv {
+            KvType::Q8_0 if c.head_dim % QK != 0 => KvType::F16,
+            // the rotation needs power-of-two blocks of at least 16 values
+            KvType::Turbo4 if c.head_dim % QK != 0 || c.head_dim > 512 => KvType::F16,
+            k => k,
+        };
         let cache = (0..c.n_layer)
             .map(|il| {
                 let slots = if c.is_swa(il) { (c.swa_window + max_batch).min(n_ctx) } else { n_ctx };
@@ -97,11 +113,16 @@ impl CpuBackend {
                 match kv {
                     KvType::F16 => {
                         let n = rows * c.head_dim;
-                        LayerCache { k: vec![0; n], v: vec![0; n], kq: Vec::new(), vq: Vec::new(), slots, ty: kv }
+                        LayerCache { k: vec![0; n], v: vec![0; n], kq: Vec::new(), vq: Vec::new(), slots, ty: kv, rot: None }
                     }
                     KvType::Q8_0 => {
                         let n = rows * GgmlType::Q8_0.row_bytes(c.head_dim);
-                        LayerCache { k: Vec::new(), v: Vec::new(), kq: vec![0; n], vq: vec![0; n], slots, ty: kv }
+                        LayerCache { k: Vec::new(), v: Vec::new(), kq: vec![0; n], vq: vec![0; n], slots, ty: kv, rot: None }
+                    }
+                    KvType::Turbo4 => {
+                        let n = rows * crate::turbo::row_bytes_4(c.head_dim);
+                        let rot = Some(crate::turbo::Rotation::new(c.head_dim, crate::turbo::KV_SEED));
+                        LayerCache { k: Vec::new(), v: Vec::new(), kq: vec![0; n], vq: vec![0; n], slots, ty: kv, rot }
                     }
                 }
             })
@@ -143,6 +164,8 @@ impl CpuBackend {
             sin_swa: vec![0.0; max_batch * half],
             acts: QuantActs::new(),
             hidden_rows: 0,
+            stream: false,
+            ffn_capture: None,
             model,
             pool,
             n_ctx,
@@ -156,6 +179,24 @@ impl CpuBackend {
     /// Bytes used by the KV cache.
     pub fn kv_bytes(&self) -> usize {
         self.cache.iter().map(|c| (c.k.len() + c.v.len()) * 2 + c.kq.len() + c.vq.len()).sum()
+    }
+
+    /// Layer streaming for models larger than RAM: while layer `l` computes, layer `l+1`
+    /// is prefetched from flash and layer `l-1`'s pages are released. Peak weight memory
+    /// becomes about two layers plus embeddings/output head, at the cost of re-reading
+    /// weights every token (flash bandwidth bound).
+    pub fn set_streaming(&mut self, on: bool) {
+        self.stream = on;
+    }
+
+    /// Start recording the normalized input of every feed-forward block (calibration for
+    /// `rie moefy`); [`CpuBackend::take_ffn_inputs`] returns `[layer][token * n_embd]`.
+    pub fn capture_ffn_inputs(&mut self) {
+        self.ffn_capture = Some(vec![Vec::new(); self.model.layers.len()]);
+    }
+
+    pub fn take_ffn_inputs(&mut self) -> Vec<Vec<f32>> {
+        self.ffn_capture.take().unwrap_or_default()
     }
 
     pub fn kv_type(&self) -> KvType {
@@ -205,6 +246,12 @@ impl CpuBackend {
 
         for (il, lw) in model.layers.iter().enumerate() {
             let swa = c.is_swa(il);
+            if self.stream {
+                model.advise_layer(il + 1, false);
+                if il > 0 {
+                    model.advise_layer(il - 1, true);
+                }
+            }
             // ---- attention block ----
             par_rmsnorm(pool, &mut self.xn, &self.x, &lw.attn_norm, n, e, c.rms_eps);
             self.acts.prepare(pool, &self.xn, n, e, &formats_for(&[&lw.wq, &lw.wk, &lw.wv]));
@@ -252,6 +299,7 @@ impl CpuBackend {
             }
             // Append K/V to the cache.
             let lc = &mut self.cache[il];
+            let mut scratch = vec![0.0f32; if lc.ty == KvType::Turbo4 { hd } else { 0 }];
             for t in 0..n {
                 let slot = (pos0 + t) % lc.slots;
                 for h in 0..c.n_head_kv {
@@ -268,6 +316,12 @@ impl CpuBackend {
                             let rb = GgmlType::Q8_0.row_bytes(hd);
                             store_q8_0(ks, &mut lc.kq[row * rb..(row + 1) * rb]);
                             store_q8_0(vs, &mut lc.vq[row * rb..(row + 1) * rb]);
+                        }
+                        KvType::Turbo4 => {
+                            let rb = crate::turbo::row_bytes_4(hd);
+                            let rot = lc.rot.as_ref().expect("turbo rotation");
+                            crate::turbo::quantize_4(rot, ks, &mut scratch, &mut lc.kq[row * rb..(row + 1) * rb]);
+                            crate::turbo::quantize_4(rot, vs, &mut scratch, &mut lc.vq[row * rb..(row + 1) * rb]);
                         }
                     }
                 }
@@ -299,6 +353,9 @@ impl CpuBackend {
 
             // ---- feed-forward block ----
             par_rmsnorm(pool, &mut self.xn, &self.x, &lw.ffn_norm, n, e, c.rms_eps);
+            if let Some(cap) = &mut self.ffn_capture {
+                cap[il].extend_from_slice(&self.xn[..n * e]);
+            }
             match &lw.ffn {
                 Ffn::Dense(d) => {
                     dense_ffn(pool, &mut self.acts, d, &self.xn[..n * e], n, c.act, &mut self.gate, &mut self.up, &mut self.o[..n * e]);
@@ -324,6 +381,10 @@ impl CpuBackend {
             residual_add(&mut self.x[..n * e], &self.o[..n * e], c.residual_scale);
         }
 
+        if self.stream {
+            model.advise_layer(model.layers.len() - 1, true);
+            model.advise_layer(0, false);
+        }
         // ---- output head ----
         let first = if all_logits { 0 } else { n - 1 };
         let m = n - first;
@@ -435,7 +496,7 @@ fn moe_ffn(
         let top = &idx[..m.n_used];
         let norm = if m.norm_topk { top.iter().map(|&i| l[i]).sum::<f32>() } else { 1.0 };
         for &i in top {
-            assign[i].push((t, l[i] / norm));
+            assign[i].push((t, if m.unit_weights { 1.0 } else { l[i] / norm }));
         }
     }
     out[..n * e].fill(0.0);
@@ -517,12 +578,23 @@ fn attention(
         let len = p + 1 - start;
         let qh = &q[t * qd + h * hd..t * qd + (h + 1) * hd];
         let sc = unsafe { std::slice::from_raw_parts_mut(sc_p.get().add(tid * n_ctx), len) };
-        let rb = GgmlType::Q8_0.row_bytes(hd);
+        let rb = match cache.ty {
+            KvType::Turbo4 => crate::turbo::row_bytes_4(hd),
+            _ => GgmlType::Q8_0.row_bytes(hd),
+        };
+        // TurboQuant: work in the rotated domain (rotation is orthogonal, so q·k = Rq·Rk)
+        let mut qrot = [0.0f32; 512];
+        if let Some(rot) = &cache.rot {
+            qrot[..hd].copy_from_slice(qh);
+            rot.apply(&mut qrot[..hd]);
+        }
         // For the Q8_0 cache the query is quantized once so scores use int8 dot kernels.
         let mut qq = [BlockQ8_0::default(); 16];
         let nqb = hd / QK;
-        if cache.ty == KvType::Q8_0 {
-            quantize_row_q8_0(qh, &mut qq[..nqb]);
+        match cache.ty {
+            KvType::Q8_0 => quantize_row_q8_0(qh, &mut qq[..nqb]),
+            KvType::Turbo4 => quantize_row_q8_0(&qrot[..hd], &mut qq[..nqb]),
+            KvType::F16 => {}
         }
         let mut max = f32::NEG_INFINITY;
         for (i, s) in sc.iter_mut().enumerate() {
@@ -531,6 +603,7 @@ fn attention(
             let mut v = match cache.ty {
                 KvType::F16 => dot_f16_f32(&cache.k[row * hd..(row + 1) * hd], qh),
                 KvType::Q8_0 => vec_dot(GgmlType::Q8_0, &cache.kq[row * rb..(row + 1) * rb], ActRow::Q8_0(&qq[..nqb]), hd),
+                KvType::Turbo4 => crate::turbo::dot_rotated_4(&qq[..nqb], &cache.kq[row * rb..(row + 1) * rb]),
             };
             if let Some(cap) = softcap {
                 v = cap * (v / cap).tanh();
@@ -551,7 +624,11 @@ fn attention(
             match cache.ty {
                 KvType::F16 => axpy_f16(o, s * inv, &cache.v[row * hd..(row + 1) * hd]),
                 KvType::Q8_0 => axpy_q8_0(o, s * inv, &cache.vq[row * rb..(row + 1) * rb]),
+                KvType::Turbo4 => crate::turbo::axpy_rotated_4(o, s * inv, &cache.vq[row * rb..(row + 1) * rb]),
             }
+        }
+        if let Some(rot) = &cache.rot {
+            rot.apply_inverse(o);
         }
     });
 }
@@ -576,6 +653,67 @@ fn axpy_q8_0(y: &mut [f32], a: f32, row: &[u8]) {
         let s = a * fp16_to_f32(u16::from_le_bytes([b[0], b[1]]));
         for (o, &q) in yb.iter_mut().zip(&b[2..]) {
             *o += s * (q as i8) as f32;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::threadpool::PoolConfig;
+
+    /// Rotated-domain attention over a TurboQuant cache must equal ordinary attention over
+    /// an f16 cache holding the reconstructed (dequantized) keys and values.
+    #[test]
+    fn turbo_attention_equals_attention_over_reconstruction() {
+        let (n_head, n_kv, hd, slots) = (4, 2, 64, 24);
+        let rot = crate::turbo::Rotation::new(hd, crate::turbo::KV_SEED);
+        let rb = crate::turbo::row_bytes_4(hd);
+        let mut s = 0x1234_5678u64;
+        let mut rnd = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        let mut tq = LayerCache {
+            k: vec![],
+            v: vec![],
+            kq: vec![0; n_kv * slots * rb],
+            vq: vec![0; n_kv * slots * rb],
+            slots,
+            ty: KvType::Turbo4,
+            rot: Some(rot.clone()),
+        };
+        let mut f = LayerCache {
+            k: vec![0; n_kv * slots * hd],
+            v: vec![0; n_kv * slots * hd],
+            kq: vec![],
+            vq: vec![],
+            slots,
+            ty: KvType::F16,
+            rot: None,
+        };
+        let (mut scratch, mut rec) = (vec![0.0; hd], vec![0.0; hd]);
+        for row in 0..n_kv * slots {
+            for (dst_q, dst_f) in [(&mut tq.kq, &mut f.k), (&mut tq.vq, &mut f.v)] {
+                let x: Vec<f32> = (0..hd).map(|_| 3.0 * rnd()).collect();
+                let r = &mut dst_q[row * rb..(row + 1) * rb];
+                crate::turbo::quantize_4(&rot, &x, &mut scratch, r);
+                crate::turbo::dequantize_4(&rot, r, &mut rec);
+                f32_to_f16_slice(&rec, &mut dst_f[row * hd..(row + 1) * hd]);
+            }
+        }
+        let pool = ThreadPool::new(PoolConfig { n_threads: 2, cores: vec![], spin: std::time::Duration::from_micros(10) });
+        let n_tok = 3;
+        // moderate scores: the query is int8-quantized for the dot products (as for Q8_0 KV)
+        let q: Vec<f32> = (0..n_tok * n_head * hd).map(|_| 0.2 * rnd()).collect();
+        let (mut oa, mut ob) = (vec![0.0; q.len()], vec![0.0; q.len()]);
+        let mut sc = vec![0.0; 2 * slots];
+        attention(&pool, n_head, n_kv, hd, n_tok, 20, 0, None, &q, &tq, &mut oa, &mut sc, slots);
+        attention(&pool, n_head, n_kv, hd, n_tok, 20, 0, None, &q, &f, &mut ob, &mut sc, slots);
+        for (a, b) in oa.iter().zip(&ob) {
+            assert!((a - b).abs() < 5e-3, "{a} vs {b}");
         }
     }
 }

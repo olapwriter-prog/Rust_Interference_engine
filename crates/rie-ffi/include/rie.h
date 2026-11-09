@@ -23,7 +23,7 @@ typedef struct RieConfig {
     int32_t use_gpu;     /* 1 = Vulkan/Metal backend (library built with "gpu" feature) */
     int32_t pin_threads; /* 1 = pin workers to performance cores (Android/Linux) */
     int32_t mlock;       /* 1 = lock weights in RAM */
-    int32_t kv_q8;       /* 1 = 8-bit (Q8_0) KV cache: ~47% less memory */
+    int32_t kv_q8;       /* KV cache: 0 = f16, 1 = 8-bit Q8_0 (~47% less), 2 = TurboQuant 4-bit (~74% less) */
 } RieConfig;
 
 typedef struct RieSampling {

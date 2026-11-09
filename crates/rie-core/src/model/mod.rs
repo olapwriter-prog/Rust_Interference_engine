@@ -52,6 +52,10 @@ pub struct MoeFfn {
     /// Always-on shared expert (Qwen2-MoE), optionally scaled by `sigmoid(shared_gate · x)`.
     pub shared: Option<DenseFfn>,
     pub shared_gate: Option<Vec<f32>>,
+    /// Selected experts are summed with weight 1 (models converted from dense ones by
+    /// `rie moefy`, GGUF key `rie.expert_gating = "unit"`): with all experts selected the
+    /// result equals the original dense feed-forward block exactly.
+    pub unit_weights: bool,
 }
 
 pub enum Ffn {
@@ -173,6 +177,7 @@ impl Model {
                     norm_topk: cfg.expert_norm_topk,
                     shared,
                     shared_gate: opt_vec(&p("ffn_gate_inp_shexp.weight"))?,
+                    unit_weights: gguf.get_str("rie.expert_gating") == Some("unit"),
                 })
             } else {
                 let (gate, up) = match opt(&p("ffn_gate.weight"))? {
@@ -239,6 +244,23 @@ impl Model {
             bail!(Format, "output matrix {}x{} does not cover vocabulary {} x {}", output.rows, output.cols, cfg.n_vocab, cfg.n_embd);
         }
         Ok(Model { cfg, token_embd, output_norm, output, rope_factors, layers, gguf })
+    }
+
+    /// Layer streaming: ask the OS to start reading layer `il` from flash
+    /// (`release == false`), or to drop its pages from RAM (`release == true`). Dropped
+    /// pages of a read-only mapping are transparently re-read on next use, so models
+    /// larger than free RAM keep running instead of being killed by the low-memory killer.
+    /// No-op for models held in memory.
+    pub fn advise_layer(&self, il: usize, release: bool) {
+        #[cfg(unix)]
+        if self.gguf.is_mapped() {
+            if let Some(l) = self.layers.get(il) {
+                let adv = if release { libc::MADV_DONTNEED } else { libc::MADV_WILLNEED };
+                l.all_weights().iter().for_each(|w| w.advise(adv));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (il, release);
     }
 
     /// Total bytes of weights (as stored).

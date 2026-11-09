@@ -95,6 +95,43 @@ pub fn write_json(w: &mut TcpStream, status: u16, body: &str) -> std::io::Result
     w.flush()
 }
 
+pub fn write_text(w: &mut TcpStream, status: u16, content_type: &str, body: &str) -> std::io::Result<()> {
+    write!(
+        w,
+        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{body}",
+        reason(status),
+        body.len()
+    )?;
+    w.flush()
+}
+
+/// Value of query parameter `key` in `path` (`/x?a=1&b=2`), percent-decoded.
+pub fn query_param(path: &str, key: &str) -> Option<String> {
+    let q = path.split_once('?')?.1;
+    q.split('&').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == key).map(|(_, v)| percent_decode(v))
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < b.len() => match u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16) {
+                Ok(v) => {
+                    out.push(v);
+                    i += 2;
+                }
+                Err(_) => out.push(b'%'),
+            },
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Start an SSE stream (the connection is closed when the stream ends).
 pub fn start_sse(w: &mut TcpStream) -> std::io::Result<()> {
     write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n")?;

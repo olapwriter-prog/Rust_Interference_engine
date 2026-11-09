@@ -18,11 +18,13 @@
 
 pub mod chat;
 pub mod constrain;
+pub mod convert;
 pub mod cpu;
 pub mod engine;
 pub mod error;
 pub mod gguf;
 pub mod kernels;
+pub mod memory;
 pub mod model;
 pub mod ops;
 pub mod quant;
@@ -33,6 +35,7 @@ pub mod tensor;
 pub mod testing;
 pub mod threadpool;
 pub mod tokenizer;
+pub mod turbo;
 
 pub use engine::{Engine, EngineConfig, GenerateParams, GenerationStats, StopReason};
 pub use error::{Error, Result};

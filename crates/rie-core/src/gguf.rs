@@ -310,6 +310,12 @@ impl GgufFile {
         }
     }
 
+    /// True when the weights are a read-only file mapping (pages can be dropped and
+    /// re-read from flash on demand).
+    pub fn is_mapped(&self) -> bool {
+        matches!(self.storage, Storage::Mmap(_))
+    }
+
     /// Optionally lock weights in RAM (mlock). Fails silently when not permitted.
     pub fn lock_in_memory(&self) -> bool {
         #[cfg(unix)]

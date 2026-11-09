@@ -18,6 +18,10 @@ fn server() -> u16 {
 
 /// Start a fresh server (own engine and adapter) and return its port.
 fn start_server() -> u16 {
+    start_server_with(|_| {})
+}
+
+fn start_server_with(tweak: impl FnOnce(&mut ServerConfig)) -> u16 {
     {
         let mut spec = SyntheticSpec::tiny("qwen2", GgmlType::Q8_0);
         spec.ctx = 4096;
@@ -35,6 +39,8 @@ fn start_server() -> u16 {
             max_string: 48,
             ..Default::default()
         };
+        let mut cfg = cfg;
+        tweak(&mut cfg);
         let engine = build_engine(&cfg).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -239,4 +245,52 @@ fn llama_server_compatible_flags() {
     assert_eq!((c.n_ctx, c.port, c.threads, c.alias.as_deref()), (8192, 9123, Some(4), Some("qwen")));
     assert_eq!(c.kv, rie_core::KvType::Q8_0);
     assert!(c.mlock && !c.gpu);
+}
+
+#[test]
+fn memory_tool_cards_and_tool_recall() {
+    let dir = std::env::temp_dir().join(format!("rie-server-memory-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let d = dir.clone();
+    let port = start_server_with(move |c| {
+        c.memory = Some(d);
+        c.force_tools = true;
+        c.tool_recall = 1;
+    });
+    let post_to = |path: &str, body: Value| -> Value {
+        let (st, b) = request_to(port, "POST", path, Some(&body));
+        assert_eq!(st, 200, "{path}: {b}");
+        serde_json::from_str(&b).unwrap()
+    };
+    // 1) a conversation in which weather.get failed once
+    let msgs = json!([
+        {"role": "user", "content": "what is the weather in Paris"},
+        {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "weather.get", "arguments": "{\"city\":\"Paris\",\"unit\":\"k\"}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "Error: invalid argument unit: use c or f"},
+        {"role": "user", "content": "check the weather in Paris again"}
+    ]);
+    for _ in 0..3 {
+        // the server executes recall_memory itself: the client only ever sees its own tools
+        let r = post_to("/v1/chat/completions", json!({"messages": msgs, "tools": tools(), "max_tokens": 200, "temperature": 0.9}));
+        let name = r.pointer("/choices/0/message/tool_calls/0/function/name").and_then(Value::as_str).unwrap_or("").to_string();
+        // tool recall shows only the most relevant tool (+ tools already used): weather.get
+        assert_eq!(name, "weather.get", "{r}");
+    }
+    // 2) the failure was learned once (conversations are resent), as a tool card on disk
+    let (st, card) = request_to(port, "GET", "/v1/tools/weather.get", None);
+    assert_eq!(st, 200);
+    assert!(card.contains("1 calls, 1 failed") && card.contains("invalid argument unit"), "{card}");
+    assert!(dir.join("tools/weather.get.md").exists() && dir.join("tools.json").exists());
+    let (_, list) = request_to(port, "GET", "/v1/tools", None);
+    assert!(list.contains("fin.loan_emi"), "harvested: {list}");
+    // 3) observations were recorded and can be searched, notes can be added
+    post_to("/v1/memory", json!({"text": "The user's home city is Lyon", "importance": 0.9}));
+    let (_, found) = request_to(port, "GET", "/v1/memory?q=where%20does%20the%20user%20live%20home%20city&k=1", None);
+    assert!(found.contains("Lyon"), "{found}");
+    let (_, found) = request_to(port, "GET", "/v1/memory?q=weather+unit+error&k=3", None);
+    assert!(found.contains("invalid argument unit"), "{found}");
+    let (st, md) = request_to(port, "GET", "/v1/memory", None);
+    assert_eq!(st, 200);
+    assert!(md.starts_with("# Memory") && md.contains("**result** `weather.get` ✗"), "{md}");
+    assert!(dir.join("observations.rmem").exists());
 }

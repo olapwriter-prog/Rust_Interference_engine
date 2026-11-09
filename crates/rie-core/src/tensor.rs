@@ -81,4 +81,18 @@ impl Weight {
     pub fn size_bytes(&self) -> usize {
         self.len
     }
+
+    /// madvise() the pages of this weight. Only meaningful (and only safe for
+    /// `DontNeed`) on read-only file mappings, which [`crate::model::Model::advise_layer`]
+    /// checks before calling.
+    #[cfg(unix)]
+    pub(crate) fn advise(&self, advice: libc::c_int) {
+        let page = 4096usize;
+        let start = self.ptr as usize & !(page - 1);
+        let end = self.ptr as usize + self.len;
+        // SAFETY: the range lies within (page-rounded) mapped memory owned by the model.
+        unsafe {
+            libc::madvise(start as *mut libc::c_void, end - start, advice);
+        }
+    }
 }

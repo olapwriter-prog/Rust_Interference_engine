@@ -17,19 +17,23 @@
 //!   `llama-server` themselves can launch `rie-server` instead.
 
 pub mod http;
+pub mod toolbook;
 pub mod tools;
 
+use rie_core::constrain::{ArgType, ToolSig};
 use rie_core::engine::{load_model, make_pool, Engine, EngineConfig, GenerateParams};
+use rie_core::memory::{Kind, MemoryStore};
 use rie_core::model::cpu::{CpuBackend, KvType};
 use rie_core::rl::{AdapterConfig, Step};
 use rie_core::SamplerParams;
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use toolbook::ToolBook;
 use tools::{extract, parse_messages, parse_tools, render, ApiMessage, CallFormat, ToolCallFilter};
 
 #[derive(Debug, Clone)]
@@ -43,6 +47,8 @@ pub struct ServerConfig {
     pub threads: Option<usize>,
     pub kv: KvType,
     pub mlock: bool,
+    /// Stream layers from flash (models larger than RAM).
+    pub stream: bool,
     pub gpu: bool,
     /// Grammar-constrain tool calls (default on).
     pub constrain: bool,
@@ -62,6 +68,16 @@ pub struct ServerConfig {
     pub force_tools: bool,
     /// Soft byte budget for one constrained tool call / JSON reply (then it winds down).
     pub max_call: usize,
+    /// On-device memory + tool book directory (observations journal, tool cards).
+    pub memory: Option<PathBuf>,
+    /// Observations kept before the least-retained are forgotten.
+    pub memory_size: usize,
+    /// Observations recalled into the context per request (0 = only via the tool).
+    pub recall: usize,
+    /// Offer the built-in `recall_memory` tool (executed inside the server).
+    pub memory_tool: bool,
+    /// Show only the K tools most relevant to the request (0 = all).
+    pub tool_recall: usize,
 }
 
 impl Default for ServerConfig {
@@ -76,6 +92,7 @@ impl Default for ServerConfig {
             threads: None,
             kv: KvType::F16,
             mlock: false,
+            stream: false,
             gpu: false,
             constrain: true,
             rl: false,
@@ -86,6 +103,11 @@ impl Default for ServerConfig {
             max_string: 4096,
             force_tools: false,
             max_call: 16384,
+            memory: None,
+            memory_size: 20000,
+            recall: 3,
+            memory_tool: true,
+            tool_recall: 0,
         }
     }
 }
@@ -110,6 +132,35 @@ pub struct State {
     /// tool_call_id → completion id
     call_index: HashMap<String, String>,
     counter: u64,
+    /// on-device episodic memory (with `--memory DIR`)
+    pub memory: Option<MemoryStore>,
+    /// harvested tools and what was learned about them (persisted with `--memory DIR`)
+    pub toolbook: ToolBook,
+    /// tool_call_ids already learned from (conversations are resent with every request)
+    observed: HashSet<String>,
+    observed_order: VecDeque<String>,
+}
+
+/// Name of the built-in memory tool.
+pub const RECALL_TOOL: &str = "recall_memory";
+const MAX_OBSERVED: usize = 4096;
+
+fn recall_tool() -> (Value, ToolSig) {
+    let schema = json!({"type": "function", "function": {"name": RECALL_TOOL,
+        "description": "Search your long-term memory on this device: earlier requests, actions you took, tool results and errors, and notes. Use it when something may have come up before.",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "what to look for"}}, "required": ["query"]}}});
+    (
+        schema,
+        ToolSig { name: RECALL_TOOL.into(), args: vec![("query".into(), ArgType::String)], required: vec!["query".into()], enums: vec![] },
+    )
+}
+
+fn clip(s: &str, max: usize) -> String {
+    let mut out: String = s.chars().take(max).collect();
+    if s.chars().count() > max {
+        out.push('…');
+    }
+    out
 }
 
 const MAX_RECORDS: usize = 16;
@@ -121,7 +172,103 @@ impl State {
             .alias
             .clone()
             .unwrap_or_else(|| cfg.model.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "rie".into()));
-        State { engine, cfg, alias, records: HashMap::new(), order: VecDeque::new(), call_index: HashMap::new(), counter: 0 }
+        let memory = cfg.memory.as_ref().and_then(|d| match MemoryStore::open(d, cfg.memory_size) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("rie-server: memory disabled, cannot open {}: {e}", d.display());
+                None
+            }
+        });
+        let toolbook = cfg.memory.as_ref().map(|d| ToolBook::open(d.clone())).unwrap_or_else(ToolBook::in_memory);
+        State {
+            engine,
+            cfg,
+            alias,
+            records: HashMap::new(),
+            order: VecDeque::new(),
+            call_index: HashMap::new(),
+            counter: 0,
+            memory,
+            toolbook,
+            observed: HashSet::new(),
+            observed_order: VecDeque::new(),
+        }
+    }
+
+    /// Learn from an incoming conversation: harvest tool definitions, attribute every new
+    /// tool result to the call that produced it, and record observations.
+    fn learn(&mut self, msgs: &[ApiMessage], schemas: &[Value]) {
+        let mut changed = self.toolbook.harvest(schemas);
+        let mut calls: HashMap<&str, (&str, &str)> = HashMap::new();
+        for m in msgs.iter().filter(|m| m.role == "assistant") {
+            for c in &m.tool_calls {
+                calls.insert(c.id.as_str(), (c.name.as_str(), c.arguments.as_str()));
+            }
+        }
+        for m in msgs.iter().filter(|m| m.role == "tool") {
+            let Some(id) = &m.tool_call_id else { continue };
+            if self.observed.contains(id) {
+                continue;
+            }
+            let Some((name, args)) = calls.get(id.as_str()).copied().or_else(|| m.name.as_deref().map(|n| (n, ""))) else { continue };
+            if name == RECALL_TOOL {
+                continue;
+            }
+            self.observed.insert(id.clone());
+            self.observed_order.push_back(id.clone());
+            if self.observed_order.len() > MAX_OBSERVED {
+                if let Some(old) = self.observed_order.pop_front() {
+                    self.observed.remove(&old);
+                }
+            }
+            let ok = !tool_result_failed(&m.content);
+            self.toolbook.observe(name, args, &m.content, ok);
+            changed = true;
+            if let Some(mem) = &mut self.memory {
+                let text = format!("{name}({}) → {}", clip(args, 300), clip(m.content.trim(), 600));
+                mem.record(Kind::Result, name, Some(ok), if ok { 0.3 } else { 0.7 }, &text);
+            }
+        }
+        if let (Some(mem), Some(u)) = (&mut self.memory, msgs.iter().rev().find(|m| m.role == "user")) {
+            mem.record(Kind::User, "", None, 0.3, &clip(&u.content, 1500));
+        }
+        if changed {
+            self.toolbook.save();
+        }
+    }
+
+    /// Context recalled for this request: relevant observations and learned tool notes.
+    fn recalled_context(&mut self, msgs: &[ApiMessage], query: &str, offered: &[String]) -> Option<String> {
+        let mut parts = Vec::new();
+        if let (Some(mem), true) = (&mut self.memory, self.cfg.recall > 0) {
+            let in_context = |t: &str| {
+                let key: String = t.chars().take(60).collect();
+                msgs.iter().any(|m| m.content.contains(&key))
+            };
+            let hits: Vec<String> = mem
+                .recall(query, self.cfg.recall + 4, None, 0.3)
+                .into_iter()
+                .filter(|r| !in_context(&r.obs.text))
+                .take(self.cfg.recall)
+                .map(|r| {
+                    let ok = match r.obs.ok {
+                        Some(true) => " ok",
+                        Some(false) => " FAILED",
+                        None => "",
+                    };
+                    format!("- [{}{ok}] {}", r.obs.kind.name(), clip(&r.obs.text.replace('\n', " "), 300))
+                })
+                .collect();
+            if !hits.is_empty() {
+                parts.push(format!("Recalled from earlier sessions:\n{}", hits.join("\n")));
+            }
+        }
+        let names: Vec<String> = offered.iter().filter(|n| n.as_str() != RECALL_TOOL).cloned().collect();
+        let notes = self.toolbook.notes(&names);
+        if !notes.is_empty() {
+            parts.push(format!("What you learned about these tools:\n{notes}"));
+        }
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
     }
 
     fn next_id(&mut self, prefix: &str) -> String {
@@ -220,7 +367,7 @@ pub fn build_engine(cfg: &ServerConfig) -> Result<Engine, String> {
     if cfg.gpu && !wants_rl {
         match rie_gpu::GpuBackend::new(
             model.clone(),
-            rie_gpu::GpuConfig { n_ctx, max_batch: cfg.n_batch.min(32), kv_q8: cfg.kv == KvType::Q8_0, ..Default::default() },
+            rie_gpu::GpuConfig { n_ctx, max_batch: cfg.n_batch.min(32), kv_q8: cfg.kv != KvType::F16, ..Default::default() },
         ) {
             Ok(b) => return Ok(Engine::with_backend(model, tok, Box::new(b))),
             Err(e) => eprintln!("rie-server: GPU unavailable ({e}); using the CPU"),
@@ -229,8 +376,16 @@ pub fn build_engine(cfg: &ServerConfig) -> Result<Engine, String> {
     if cfg.gpu && wants_rl {
         eprintln!("rie-server: online learning needs the CPU backend; ignoring --gpu");
     }
-    let ecfg = EngineConfig { n_threads: cfg.threads, n_ctx, n_batch: cfg.n_batch, kv_type: cfg.kv, ..Default::default() };
-    let backend = CpuBackend::with_kv_type(model.clone(), make_pool(&ecfg), n_ctx, ecfg.n_batch, ecfg.kv_type);
+    let ecfg = EngineConfig {
+        n_threads: cfg.threads,
+        n_ctx,
+        n_batch: cfg.n_batch,
+        kv_type: cfg.kv,
+        stream_layers: cfg.stream,
+        ..Default::default()
+    };
+    let mut backend = CpuBackend::with_kv_type(model.clone(), make_pool(&ecfg), n_ctx, ecfg.n_batch, ecfg.kv_type);
+    backend.set_streaming(ecfg.stream_layers);
     let mut engine = Engine::with_backend(model, tok, Box::new(backend));
     if let Some(p) = &cfg.adapter {
         engine.load_adapter(p, cfg.rl_cfg.clone()).map_err(|e| e.to_string())?;
@@ -377,6 +532,52 @@ fn route(req: &http::Request, w: &mut TcpStream, state: &Arc<Mutex<State>>) -> s
             st.save_adapter();
             http::write_json(w, 200, r#"{"ok":true}"#)?
         }
+        ("GET", "/v1/memory") => {
+            let mut st = lock(state);
+            let Some(mem) = st.memory.as_mut() else {
+                http::write_json(w, 400, &err_json("memory is disabled (start with --memory DIR)", "invalid_request_error"))?;
+                return Ok(true);
+            };
+            match http::query_param(&req.path, "q") {
+                Some(q) => {
+                    let k = http::query_param(&req.path, "k").and_then(|v| v.parse().ok()).unwrap_or(5usize).min(50);
+                    let hits: Vec<Value> = mem
+                        .recall(&q, k, None, 0.0)
+                        .into_iter()
+                        .map(|r| json!({"id": r.obs.id, "score": r.score, "kind": r.obs.kind.name(), "tool": r.obs.tool, "ok": r.obs.ok, "ts": r.obs.ts, "recalls": r.obs.recalls, "text": r.obs.text}))
+                        .collect();
+                    http::write_json(w, 200, &json!({"query": q, "results": hits}).to_string())?
+                }
+                None => {
+                    let n = http::query_param(&req.path, "n").and_then(|v| v.parse().ok()).unwrap_or(200usize);
+                    http::write_text(w, 200, "text/markdown; charset=utf-8", &mem.to_markdown(n))?
+                }
+            }
+        }
+        ("POST", "/v1/memory") => {
+            let mut st = lock(state);
+            let Some(mem) = st.memory.as_mut() else {
+                http::write_json(w, 400, &err_json("memory is disabled (start with --memory DIR)", "invalid_request_error"))?;
+                return Ok(true);
+            };
+            let text = body.get("text").and_then(Value::as_str).unwrap_or("");
+            let kind = body.get("kind").and_then(Value::as_str).and_then(Kind::parse).unwrap_or(Kind::Note);
+            let tool = body.get("tool").and_then(Value::as_str).unwrap_or("");
+            let importance = body.get("importance").and_then(Value::as_f64).unwrap_or(0.8) as f32;
+            let id = mem.record(kind, tool, body.get("ok").and_then(Value::as_bool), importance, text);
+            http::write_json(w, 200, &json!({"ok": true, "id": id, "stored": id.is_some(), "count": mem.len()}).to_string())?
+        }
+        ("GET", "/v1/tools") => {
+            let st = lock(state);
+            http::write_json(w, 200, &json!({"tools": st.toolbook.to_json()}).to_string())?
+        }
+        ("GET", p) if p.starts_with("/v1/tools/") => {
+            let st = lock(state);
+            match st.toolbook.tools.get(&p["/v1/tools/".len()..]) {
+                Some(e) => http::write_text(w, 200, "text/markdown; charset=utf-8", &e.card())?,
+                None => http::write_json(w, 404, &err_json("unknown tool", "not_found"))?,
+            }
+        }
         ("OPTIONS", _) => {
             use std::io::Write;
             write!(w, "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nContent-Length: 0\r\n\r\n")?;
@@ -461,22 +662,24 @@ fn visible_prefix(text: &str, format: CallFormat, tools: bool) -> &str {
 }
 
 fn chat(body: &Value, w: &mut TcpStream, state: &Arc<Mutex<State>>) -> std::io::Result<bool> {
-    let msgs = parse_messages(body.get("messages").unwrap_or(&Value::Null));
+    let mut msgs = parse_messages(body.get("messages").unwrap_or(&Value::Null));
     if msgs.is_empty() {
         http::write_json(w, 400, &err_json("messages must be a non-empty array", "invalid_request_error"))?;
         return Ok(true);
     }
-    let (schemas, mut sigs) = parse_tools(body.get("tools"));
+    let (mut schemas, mut sigs) = parse_tools(body.get("tools"));
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let include_usage = body.pointer("/stream_options/include_usage").and_then(Value::as_bool).unwrap_or(false);
     let json_mode = body.pointer("/response_format/type").and_then(Value::as_str).is_some_and(|t| t == "json_object" || t == "json_schema");
     // tool_choice: "none" | "auto" | "required" | {"type":"function","function":{"name":…}}
+    let mut named = false;
     let (use_tools, forced) = match body.get("tool_choice") {
         Some(Value::String(s)) if s == "none" => (false, false),
         Some(Value::String(s)) if s == "required" => (true, true),
         Some(Value::Object(o)) => {
             if let Some(n) = o.get("function").and_then(|f| f.get("name")).and_then(Value::as_str) {
                 sigs.retain(|t| t.name == n);
+                named = true;
             }
             (true, true)
         }
@@ -487,14 +690,38 @@ fn chat(body: &Value, w: &mut TcpStream, state: &Arc<Mutex<State>>) -> std::io::
     let mut st = lock(state);
     let forced = forced || (use_tools && st.cfg.force_tools);
     st.auto_reward(&msgs);
+    st.learn(&msgs, &schemas);
+    // what this request is about: the latest user message and the latest tool result
+    let query = {
+        let u = msgs.iter().rev().find(|m| m.role == "user").map(|m| m.content.as_str()).unwrap_or("");
+        let t = msgs.last().filter(|m| m.role == "tool").map(|m| m.content.as_str()).unwrap_or("");
+        format!("{} {}", clip(u, 1000), clip(t, 500))
+    };
+    // tool recall: only show the tools relevant to this request (plus those already used)
+    if use_tools && !named && st.cfg.tool_recall > 0 && sigs.len() > st.cfg.tool_recall {
+        let names: Vec<String> = sigs.iter().map(|t| t.name.clone()).collect();
+        let mut keep: HashSet<String> = st.toolbook.relevant(&query, &names, st.cfg.tool_recall).into_iter().collect();
+        msgs.iter().flat_map(|m| &m.tool_calls).for_each(|c| {
+            keep.insert(c.name.clone());
+        });
+        sigs.retain(|t| keep.contains(&t.name));
+        schemas.retain(|s| s.pointer("/function/name").and_then(Value::as_str).is_some_and(|n| keep.contains(n)));
+    }
+    let memory_tool = use_tools && !named && st.cfg.memory_tool && st.memory.is_some();
+    if memory_tool {
+        let (sc, sg) = recall_tool();
+        schemas.push(sc);
+        sigs.push(sg);
+    }
+    let offered: Vec<String> = if use_tools { sigs.iter().map(|t| t.name.clone()).collect() } else { Vec::new() };
+    if let Some(ctx) = st.recalled_context(&msgs, &query, &offered) {
+        if let Some(m) = msgs.iter_mut().rev().find(|m| m.role == "user" || m.role == "tool") {
+            m.content.push_str(&format!("\n\n<context>\n{ctx}\n</context>"));
+        }
+    }
     let template = st.engine.template;
     let format = CallFormat::for_template(template);
-    let mut prompt = render(template, &msgs, if use_tools { &schemas } else { &[] }, true);
     let forced = forced && use_tools && st.cfg.constrain;
-    if forced {
-        prompt.push_str(format.call_prefix());
-    }
-    let tokens = st.engine.tokenize(&prompt, true, true);
     let params = GenerateParams {
         max_tokens: body
             .get("max_tokens")
@@ -509,15 +736,6 @@ fn chat(body: &Value, w: &mut TcpStream, state: &Arc<Mutex<State>>) -> std::io::
     let id = st.next_id("chatcmpl-");
     let model = st.alias.clone();
     let created = now();
-    let mut filter = ToolCallFilter::with_limits(
-        format,
-        if use_tools { sigs.clone() } else { Vec::new() },
-        forced,
-        st.cfg.constrain && use_tools,
-        st.cfg.max_string,
-        st.cfg.max_call,
-    );
-    let mut json_filter = JsonModeFilter::new(json_mode && !use_tools, st.cfg.max_string, st.cfg.max_call);
 
     if stream {
         http::start_sse(w)?;
@@ -525,66 +743,137 @@ fn chat(body: &Value, w: &mut TcpStream, state: &Arc<Mutex<State>>) -> std::io::
             "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": Value::Null}]});
         http::sse(w, &first.to_string())?;
     }
-    let mut text = String::new();
-    let mut emitted = 0usize;
-    let mut broken = false;
-    let res = {
-        let wref = &mut *w;
-        let mut on_text = |piece: &str| -> bool {
-            text.push_str(piece);
-            if stream {
-                let vis = visible_prefix(&text, format, use_tools);
-                if vis.len() > emitted && vis.is_char_boundary(emitted) {
-                    let delta = &vis[emitted..];
-                    let chunk = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": Value::Null}]});
-                    if http::sse(wref, &chunk.to_string()).is_err() {
-                        broken = true;
-                        return false;
-                    }
-                    emitted = vis.len();
-                }
-            }
-            true
-        };
-        if json_filter.enabled {
-            st.engine.generate_hooked(&tokens, &params, &mut json_filter, &mut on_text)
+    // One internal round for the built-in memory tool, which the server executes
+    // itself; the client only sees the final answer or tool call.
+    let mut round = 0;
+    let (stats, content, call, filter, tokens, emitted) = loop {
+        round += 1;
+        let last_round = round >= 2;
+        let (r_schemas, r_sigs): (Vec<Value>, Vec<ToolSig>) = if memory_tool && last_round {
+            (
+                schemas.iter().filter(|s| s.pointer("/function/name").and_then(Value::as_str) != Some(RECALL_TOOL)).cloned().collect(),
+                sigs.iter().filter(|t| t.name != RECALL_TOOL).cloned().collect(),
+            )
         } else {
-            st.engine.generate_hooked(&tokens, &params, &mut filter, &mut on_text)
+            (schemas.clone(), sigs.clone())
+        };
+        let mut prompt = render(template, &msgs, if use_tools { &r_schemas } else { &[] }, true);
+        if forced {
+            prompt.push_str(format.call_prefix());
         }
-    };
-    if let Ok(path) = std::env::var("RIE_SERVER_LOG") {
-        // debugging aid: request summary + what was generated
-        use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let req = json!({"tool_choice": body.get("tool_choice"), "n_tools": sigs.len(), "max_tokens": params.max_tokens, "stop": params.stop_strings,
-                "temperature": body.get("temperature"), "n_messages": msgs.len(), "forced": forced, "prompt_tokens": tokens.len()});
-            let out = match &res {
-                Ok(s) => {
-                    json!({"stop": format!("{:?}", s.stop), "generated": s.generated_tokens, "text": String::from_utf8_lossy(&filter.raw).chars().take(300).collect::<String>()})
+        let tokens = st.engine.tokenize(&prompt, true, true);
+        let mut filter = ToolCallFilter::with_limits(
+            format,
+            if use_tools { r_sigs } else { Vec::new() },
+            forced,
+            st.cfg.constrain && use_tools,
+            st.cfg.max_string,
+            st.cfg.max_call,
+        );
+        let mut json_filter = JsonModeFilter::new(json_mode && !use_tools, st.cfg.max_string, st.cfg.max_call);
+        let mut text = String::new();
+        let mut emitted = 0usize;
+        let mut broken = false;
+        let res = {
+            let wref = &mut *w;
+            let mut on_text = |piece: &str| -> bool {
+                text.push_str(piece);
+                if stream {
+                    let vis = visible_prefix(&text, format, use_tools);
+                    if vis.len() > emitted && vis.is_char_boundary(emitted) {
+                        let delta = &vis[emitted..];
+                        let chunk = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                            "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": Value::Null}]});
+                        if http::sse(wref, &chunk.to_string()).is_err() {
+                            broken = true;
+                            return false;
+                        }
+                        emitted = vis.len();
+                    }
                 }
-                Err(e) => json!({"error": e.to_string()}),
+                true
             };
-            let _ = writeln!(f, "{}", json!({"request": req, "result": out}));
-        }
-    }
-    let stats = match res {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = e.to_string();
-            let status = if msg.contains("context") { 400 } else { 500 };
-            if stream {
-                let _ = http::sse(w, &err_json(&msg, "server_error"));
-                return Ok(false);
+            if json_filter.enabled {
+                st.engine.generate_hooked(&tokens, &params, &mut json_filter, &mut on_text)
+            } else {
+                st.engine.generate_hooked(&tokens, &params, &mut filter, &mut on_text)
             }
-            http::write_json(w, status, &err_json(&msg, if status == 400 { "invalid_request_error" } else { "server_error" }))?;
-            return Ok(true);
+        };
+        if let Ok(path) = std::env::var("RIE_SERVER_LOG") {
+            // debugging aid: request summary + what was generated
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let req = json!({"tool_choice": body.get("tool_choice"), "n_tools": sigs.len(), "max_tokens": params.max_tokens, "stop": params.stop_strings,
+                    "temperature": body.get("temperature"), "n_messages": msgs.len(), "forced": forced, "prompt_tokens": tokens.len(), "round": round});
+                let out = match &res {
+                    Ok(s) => {
+                        json!({"stop": format!("{:?}", s.stop), "generated": s.generated_tokens, "text": String::from_utf8_lossy(&filter.raw).chars().take(300).collect::<String>()})
+                    }
+                    Err(e) => json!({"error": e.to_string()}),
+                };
+                let _ = writeln!(f, "{}", json!({"request": req, "result": out}));
+            }
         }
+        let stats = match res {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = e.to_string();
+                let status = if msg.contains("context") { 400 } else { 500 };
+                if stream {
+                    let _ = http::sse(w, &err_json(&msg, "server_error"));
+                    return Ok(false);
+                }
+                http::write_json(w, status, &err_json(&msg, if status == 400 { "invalid_request_error" } else { "server_error" }))?;
+                return Ok(true);
+            }
+        };
+        if broken {
+            return Ok(false);
+        }
+        let (content, call) = if use_tools { extract(&filter) } else { (text.trim().to_string(), None) };
+        if let Some(c) = call.as_ref().filter(|c| memory_tool && !last_round && c.name == RECALL_TOOL) {
+            let q = c.arguments.get("query").and_then(Value::as_str).unwrap_or("").to_string();
+            let found = st.memory.as_mut().map(|m| m.recall(&q, 5, None, 0.1)).unwrap_or_default();
+            let result = if found.is_empty() {
+                "No matching memories.".to_string()
+            } else {
+                found
+                    .iter()
+                    .map(|r| {
+                        let ok = match r.obs.ok {
+                            Some(true) => " ok",
+                            Some(false) => " FAILED",
+                            None => "",
+                        };
+                        format!("- [{}{ok}] {}", r.obs.kind.name(), clip(&r.obs.text.replace('\n', " "), 400))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let cid = st.next_id("mem_");
+            msgs.push(ApiMessage {
+                role: "assistant".into(),
+                content: content.clone(),
+                tool_calls: vec![tools::ApiToolCall { id: cid.clone(), name: RECALL_TOOL.into(), arguments: c.arguments.to_string() }],
+                ..Default::default()
+            });
+            msgs.push(ApiMessage {
+                role: "tool".into(),
+                content: result,
+                tool_call_id: Some(cid),
+                name: Some(RECALL_TOOL.into()),
+                ..Default::default()
+            });
+            continue;
+        }
+        break (stats, content, call, filter, tokens, emitted);
     };
-    if broken {
-        return Ok(false);
+    if let Some(mem) = &mut st.memory {
+        match &call {
+            Some(c) => mem.record(Kind::Action, &c.name, None, 0.2, &format!("called {}({})", c.name, clip(&c.arguments.to_string(), 300))),
+            None => mem.record(Kind::Action, "", None, 0.2, &format!("answered: {}", clip(&content, 400))),
+        };
     }
-    let (content, call) = if use_tools { extract(&filter) } else { (text.trim().to_string(), None) };
     let finish = match (&call, stats.stop) {
         (Some(_), _) => "tool_calls",
         (None, rie_core::StopReason::MaxTokens) | (None, rie_core::StopReason::ContextFull) => "length",
@@ -792,10 +1081,23 @@ pub fn parse_args(args: &[String]) -> Result<ServerConfig, String> {
             "-a" | "--alias" => c.alias = Some(val(&mut i)?),
             "-ctk" | "--cache-type-k" | "-ctv" | "--cache-type-v" => {
                 let v = val(&mut i)?;
-                if v.starts_with("q8") || v.starts_with("q4") || v.starts_with("q5") {
+                // llama.cpp's 4-bit KV types map to TurboQuant-4, 5/8-bit ones to Q8_0
+                if v.starts_with("q4") || v.starts_with("turbo") || v.starts_with("tq") || v.starts_with("iq4") {
+                    c.kv = KvType::Turbo4;
+                } else if v.starts_with("q8") || v.starts_with("q5") {
                     c.kv = KvType::Q8_0;
                 }
             }
+            "--kv" => {
+                let v = val(&mut i)?;
+                c.kv = KvType::parse(&v).ok_or_else(|| format!("unknown --kv {v} (f16, q8_0, turbo4)"))?;
+            }
+            "--stream" => c.stream = true,
+            "--memory" => c.memory = Some(PathBuf::from(val(&mut i)?)),
+            "--memory-size" => c.memory_size = val(&mut i)?.parse().map_err(|_| "bad --memory-size")?,
+            "--recall" => c.recall = val(&mut i)?.parse().map_err(|_| "bad --recall")?,
+            "--no-memory-tool" => c.memory_tool = false,
+            "--tool-recall" => c.tool_recall = val(&mut i)?.parse().map_err(|_| "bad --tool-recall")?,
             "--mlock" => c.mlock = true,
             "--gpu" => c.gpu = true,
             "-ngl" | "--n-gpu-layers" | "--gpu-layers" => {
@@ -878,13 +1180,24 @@ usage: rie-server -m MODEL.gguf [options]
       --host H            bind address (default 127.0.0.1)
       --port P            port (default 8080)
   -a, --alias NAME        model name reported to clients
-  -ctk/-ctv q8_0          8-bit KV cache
+  -ctk/-ctv q8_0          8-bit KV cache (q4_0 / turbo4: TurboQuant 4-bit KV, 3.9x smaller than f16)
+      --kv f16|q8_0|turbo4  KV cache format
+      --stream            stream layers from flash (models larger than RAM)
       --gpu               Vulkan/Metal backend (build with --features gpu; disables RL)
       --mlock             lock weights in RAM
       --no-constrain      do not grammar-constrain tool calls
       --max-string N      max bytes per string value in a constrained call (default 4096)
       --max-call N        soft byte budget per tool call, then wound down to a valid end (default 16384)
       --tool-choice required  force a tool call whenever tools are offered with tool_choice auto
+
+memory and tool knowledge (on the device):
+      --memory DIR        record every request, action and tool result in DIR (compact journal
+                          + TurboQuant 4-bit index), recall relevant ones into the context,
+                          and keep learned tool cards in DIR/tools/*.md
+      --memory-size N     observations kept before the weakest are forgotten (default 20000)
+      --recall N          observations recalled into each request (default 3, 0 = tool only)
+      --no-memory-tool    do not offer the built-in recall_memory tool
+      --tool-recall K     show the model only the K tools most relevant to the request
 
 online learning (reinforcement learning from feedback):
       --rl                enable correction experts (in memory)
@@ -897,4 +1210,6 @@ online learning (reinforcement learning from feedback):
 llama.cpp flags such as -ngl, -fa, --fit, --jinja, -np, --metrics are accepted and ignored.
 
 endpoints: /v1/chat/completions (tools, tool_choice, stream, response_format), /v1/completions,
-           /v1/models, /health, /props, POST /v1/feedback, POST /v1/corrections, GET /v1/rl, POST /v1/rl/reset";
+           /v1/models, /health, /props, POST /v1/feedback, POST /v1/corrections, GET /v1/rl, POST /v1/rl/reset,
+           GET /v1/memory[?q=..&k=..] (Markdown journal or search), POST /v1/memory (add a note),
+           GET /v1/tools, GET /v1/tools/NAME (learned tool card, Markdown)";

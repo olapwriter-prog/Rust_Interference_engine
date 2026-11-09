@@ -31,6 +31,9 @@ pub struct EngineConfig {
     pub mlock: bool,
     /// KV-cache storage format (Q8_0 roughly halves KV memory).
     pub kv_type: KvType,
+    /// Stream layers from flash (for models larger than free RAM), see
+    /// [`CpuBackend::set_streaming`].
+    pub stream_layers: bool,
 }
 
 impl Default for EngineConfig {
@@ -43,6 +46,7 @@ impl Default for EngineConfig {
             spin: Duration::from_micros(300),
             mlock: false,
             kv_type: KvType::F16,
+            stream_layers: false,
         }
     }
 }
@@ -201,7 +205,8 @@ impl Engine {
         }
         let n_ctx = cfg.n_ctx.min(model.cfg.ctx_train).max(16);
         let pool = make_pool(&cfg);
-        let backend = CpuBackend::with_kv_type(model.clone(), pool, n_ctx, cfg.n_batch, cfg.kv_type);
+        let mut backend = CpuBackend::with_kv_type(model.clone(), pool, n_ctx, cfg.n_batch, cfg.kv_type);
+        backend.set_streaming(cfg.stream_layers);
         Ok(Self::with_backend(model, tokenizer, Box::new(backend)))
     }
 

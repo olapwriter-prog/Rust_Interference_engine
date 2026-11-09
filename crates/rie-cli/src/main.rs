@@ -48,6 +48,34 @@ enum Cmd {
         #[arg(long)]
         chat_template: Option<String>,
     },
+    /// Re-quantize a model (e.g. F32/F16 → 4-bit Q4_0 or 8-bit Q8_0).
+    Quantize {
+        input: PathBuf,
+        output: PathBuf,
+        /// Target type: Q4_0, Q8_0 or F16.
+        #[arg(long = "type", default_value = "Q4_0")]
+        ty: String,
+    },
+    /// Convert a dense model into a mixture of experts (only the top experts run per
+    /// token). Measure quality with `perplexity` afterwards.
+    Moefy {
+        input: PathBuf,
+        output: PathBuf,
+        /// Experts per layer.
+        #[arg(long, default_value_t = 8)]
+        experts: usize,
+        /// Experts evaluated per token.
+        #[arg(long, default_value_t = 2)]
+        used: usize,
+        /// Calibration text (target-domain sample); without it, a data-free router is used.
+        #[arg(long)]
+        calib: Option<PathBuf>,
+        /// Max calibration tokens.
+        #[arg(long, default_value_t = 512)]
+        calib_tokens: usize,
+        #[arg(short, long, default_value_t = 4)]
+        threads: usize,
+    },
     /// Compute perplexity over a text file.
     Perplexity {
         #[command(flatten)]
@@ -82,9 +110,13 @@ struct Common {
     /// Lock model weights in RAM.
     #[arg(long)]
     mlock: bool,
-    /// KV-cache format: f16 or q8_0 (~47% less KV memory on CPU, ~44% on GPU).
+    /// KV-cache format: f16, q8_0 (~47% less KV memory) or turbo4 (TurboQuant 4-bit,
+    /// ~74% less on CPU; the GPU backend falls back to q8_0).
     #[arg(long, default_value = "f16")]
     kv: String,
+    /// Stream layers from flash: run models larger than free RAM (slower, flash-bound).
+    #[arg(long)]
+    stream: bool,
 }
 
 #[derive(Args)]
@@ -190,6 +222,7 @@ fn engine_config(c: &Common) -> EngineConfig {
             eprintln!("unknown --kv '{}', using f16", c.kv);
             rie_core::KvType::F16
         }),
+        stream_layers: c.stream,
         ..Default::default()
     }
 }
@@ -207,12 +240,7 @@ fn build_engine(c: &Common, gguf: Arc<GgufFile>) -> Result<Engine, Box<dyn std::
         {
             Box::new(rie_gpu::GpuBackend::new(
                 model.clone(),
-                rie_gpu::GpuConfig {
-                    n_ctx,
-                    max_batch: c.batch.min(64),
-                    kv_q8: cfg.kv_type == rie_core::KvType::Q8_0,
-                    ..Default::default()
-                },
+                rie_gpu::GpuConfig { n_ctx, max_batch: c.batch.min(64), kv_q8: cfg.kv_type != rie_core::KvType::F16, ..Default::default() },
             )?)
         }
         #[cfg(not(feature = "gpu"))]
@@ -220,7 +248,9 @@ fn build_engine(c: &Common, gguf: Arc<GgufFile>) -> Result<Engine, Box<dyn std::
             return Err("this binary was built without GPU support (rebuild with --features gpu)".into());
         }
     } else {
-        Box::new(CpuBackend::with_kv_type(model.clone(), make_pool(&cfg), n_ctx, cfg.n_batch, cfg.kv_type))
+        let mut b = CpuBackend::with_kv_type(model.clone(), make_pool(&cfg), n_ctx, cfg.n_batch, cfg.kv_type);
+        b.set_streaming(cfg.stream_layers);
+        Box::new(b)
     };
     let e = Engine::with_backend(model, tok, backend);
     eprintln!(
@@ -394,6 +424,41 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             spec.chat_template = chat_template;
             std::fs::write(&out, spec.build())?;
             println!("wrote {}", out.display());
+        }
+        Cmd::Quantize { input, output, ty } => {
+            let target = parse_type(&ty)?;
+            let src = GgufFile::open(&input)?;
+            let before = std::fs::metadata(&input)?.len();
+            let img = rie_core::convert::quantize_model(&src, target)?;
+            std::fs::write(&output, &img)?;
+            println!("wrote {} ({:.1} MB → {:.1} MB, {})", output.display(), before as f64 / 1e6, img.len() as f64 / 1e6, target.name());
+        }
+        Cmd::Moefy { input, output, experts, used, calib, calib_tokens, threads } => {
+            let g = Arc::new(GgufFile::open(&input)?);
+            let calib = match calib {
+                Some(p) => {
+                    let (_, tok) = load_model_from(g.clone())?;
+                    let mut t = tok.encode(&std::fs::read_to_string(p)?, true, false);
+                    t.truncate(calib_tokens);
+                    Some(t)
+                }
+                None => None,
+            };
+            let opts = rie_core::convert::MoefyOptions { n_expert: experts, n_used: used, calib, threads, ..Default::default() };
+            let (img, rep) = rie_core::convert::moefy(g, &opts)?;
+            std::fs::write(&output, &img)?;
+            for r in &rep {
+                match r.routed_mass {
+                    Some(m) => println!(
+                        "layer {:3}: {experts} experts × {} neurons, router keeps {:.1}% of activation mass",
+                        r.layer,
+                        r.expert_size,
+                        100.0 * m
+                    ),
+                    None => println!("layer {:3}: {experts} experts × {} neurons (data-free router)", r.layer, r.expert_size),
+                }
+            }
+            println!("wrote {}: feed-forward compute per token is now {used}/{experts} of the dense model", output.display());
         }
         Cmd::Perplexity { common, file, windows } => {
             let mut e = build_engine(&common, open_model(&common)?)?;

@@ -224,7 +224,7 @@ mod tests {
     #[test]
     fn repetition_penalty_changes_choice() {
         let mut s = Sampler::new(SamplerParams { repeat_penalty: 2.0, ..SamplerParams::greedy() });
-        assert_eq!(s.sample(&mut vec![0.1, 3.0, -1.0, 2.9], &[1]), 3);
+        assert_eq!(s.sample(&mut [0.1, 3.0, -1.0, 2.9], &[1]), 3);
     }
 
     #[test]
@@ -233,7 +233,7 @@ mod tests {
             Sampler::new(SamplerParams { temperature: 1.0, top_k: 0, top_p: 1.0, min_p: 0.0, repeat_penalty: 1.0, ..Default::default() });
         let mut hits = [0usize; 2];
         for _ in 0..4000 {
-            let t = s.sample(&mut vec![0.0, (3.0f32).ln()], &[]);
+            let t = s.sample(&mut [0.0, (3.0f32).ln()], &[]);
             hits[t as usize] += 1;
         }
         let frac = hits[1] as f32 / 4000.0;

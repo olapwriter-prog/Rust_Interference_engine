@@ -145,7 +145,7 @@ impl Reference {
                     .zip(&up)
                     .map(|(g, u)| {
                         let a = if gemma {
-                            0.5 * g * (1.0 + (0.7978845608f32 * (g + 0.044715 * g * g * g)).tanh())
+                            0.5 * g * (1.0 + (0.797_884_6_f32 * (g + 0.044715 * g * g * g)).tanh())
                         } else {
                             g / (1.0 + (-g).exp())
                         };
@@ -454,6 +454,42 @@ fn q8_0_kv_cache_matches_f16_kv_cache() {
 }
 
 #[test]
+fn turbo4_kv_cache_tracks_f16_kv_cache() {
+    use rie_core::KvType;
+    for (arch, ty) in [("llama", GgmlType::F16), ("qwen3", GgmlType::F16), ("gemma3", GgmlType::F16), ("phi3", GgmlType::Q4_0)] {
+        let spec = SyntheticSpec::tiny(arch, ty);
+        let (model, _) = load_model_from(Arc::new(GgufFile::from_bytes(spec.build()).unwrap())).unwrap();
+        let pool = Arc::new(ThreadPool::new(PoolConfig { n_threads: 3, cores: vec![], spin: Duration::from_micros(50) }));
+        let mut a = CpuBackend::with_kv_type(model.clone(), pool.clone(), 64, 4, KvType::F16);
+        let mut b = CpuBackend::with_kv_type(model.clone(), pool.clone(), 64, 4, KvType::Turbo4);
+        let mut c = CpuBackend::with_kv_type(model.clone(), pool, 64, 4, KvType::Q8_0);
+        assert_eq!(b.kv_type(), KvType::Turbo4, "{arch}: head_dim {}", model.cfg.head_dim);
+        assert!(b.kv_bytes() * 100 < a.kv_bytes() * 36, "Turbo4 KV should be ≤ ~1/3 of F16");
+        let nv = spec.n_vocab;
+        let tokens: Vec<u32> = (0..20u32).map(|i| (i * 29 + 3) % nv as u32).collect();
+        let (mut la, mut lb, mut lc) = (vec![0.0; nv], vec![0.0; nv], vec![0.0; nv]);
+        let (mut pos, mut worst, mut worst_q8) = (0, 0.0f32, 0.0f32);
+        while pos < tokens.len() {
+            let end = (pos + 4).min(tokens.len());
+            a.forward(&tokens[pos..end], pos, false, &mut la).unwrap();
+            b.forward(&tokens[pos..end], pos, false, &mut lb).unwrap();
+            c.forward(&tokens[pos..end], pos, false, &mut lc).unwrap();
+            worst = worst.max(max_rel_err(&lb, &la));
+            worst_q8 = worst_q8.max(max_rel_err(&lc, &la));
+            pos = end;
+        }
+        eprintln!(
+            "{arch} {ty:?}: Turbo4-KV vs F16-KV max rel err {worst} (Q8_0: {worst_q8}), KV bytes {} vs {}",
+            b.kv_bytes(),
+            a.kv_bytes()
+        );
+        // random synthetic weights amplify the 4-bit noise; exactness of the attention math
+        // itself is checked in the cpu module unit tests
+        assert!(worst < 0.4, "{arch} {ty:?}: {worst}");
+    }
+}
+
+#[test]
 fn context_shift_keeps_generating_and_is_consistent() {
     let spec = SyntheticSpec::tiny("llama", GgmlType::F16);
     let (model, tok) = load_model_from(Arc::new(GgufFile::from_bytes(spec.build()).unwrap())).unwrap();
@@ -495,4 +531,26 @@ fn mixture_of_experts() {
     s.n_ff_exp = 512;
     check_arch(s, 3e-3, 4);
     check_arch(SyntheticSpec::tiny("qwen3moe", GgmlType::Q4_K), 0.03, 4);
+}
+
+#[test]
+fn layer_streaming_gives_identical_results() {
+    // a real file mapping, so pages are actually released and re-read
+    let spec = SyntheticSpec::tiny("qwen3", GgmlType::Q4_0);
+    let path = std::env::temp_dir().join(format!("rie-stream-{}.gguf", std::process::id()));
+    std::fs::write(&path, spec.build()).unwrap();
+    let (model, _) = rie_core::engine::load_model(&path).unwrap();
+    assert!(model.gguf.is_mapped());
+    let pool = Arc::new(ThreadPool::new(PoolConfig { n_threads: 2, cores: vec![], spin: Duration::from_micros(50) }));
+    let mut a = CpuBackend::new(model.clone(), pool.clone(), 32, 4);
+    let mut b = CpuBackend::new(model.clone(), pool, 32, 4);
+    b.set_streaming(true);
+    let nv = spec.n_vocab;
+    let (mut la, mut lb) = (vec![0.0; nv], vec![0.0; nv]);
+    for (pos, chunk) in [[1u32, 5, 9, 2], [7, 3, 8, 4]].iter().enumerate() {
+        a.forward(chunk, pos * 4, false, &mut la).unwrap();
+        b.forward(chunk, pos * 4, false, &mut lb).unwrap();
+        assert_eq!(la, lb);
+    }
+    let _ = std::fs::remove_file(&path);
 }

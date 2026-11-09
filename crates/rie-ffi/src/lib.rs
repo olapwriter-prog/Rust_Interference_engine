@@ -101,7 +101,11 @@ pub(crate) fn load_engine(path: &str, cfg: &RieConfig) -> Result<RieEngine, Stri
         n_batch: if cfg.n_batch > 0 { cfg.n_batch as usize } else { 64 },
         pin_threads: cfg.pin_threads != 0,
         mlock: cfg.mlock != 0,
-        kv_type: if cfg.kv_q8 != 0 { rie_core::KvType::Q8_0 } else { rie_core::KvType::F16 },
+        kv_type: match cfg.kv_q8 {
+            0 => rie_core::KvType::F16,
+            2 => rie_core::KvType::Turbo4,
+            _ => rie_core::KvType::Q8_0,
+        },
         ..Default::default()
     };
     if ecfg.mlock {
