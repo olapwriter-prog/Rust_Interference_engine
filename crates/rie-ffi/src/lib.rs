@@ -110,7 +110,10 @@ pub(crate) fn load_engine(path: &str, cfg: &RieConfig) -> Result<RieEngine, Stri
     let n_ctx = ecfg.n_ctx.min(model.cfg.ctx_train).max(16);
     #[cfg(feature = "gpu")]
     if cfg.use_gpu != 0 {
-        match rie_gpu::GpuBackend::new(model.clone(), rie_gpu::GpuConfig { n_ctx, max_batch: ecfg.n_batch.min(32), ..Default::default() }) {
+        match rie_gpu::GpuBackend::new(
+            model.clone(),
+            rie_gpu::GpuConfig { n_ctx, max_batch: ecfg.n_batch.min(32), kv_q8: cfg.kv_q8 != 0, ..Default::default() },
+        ) {
             Ok(b) => {
                 return Ok(RieEngine { engine: Engine::with_backend(model, tok, Box::new(b)), cancel: Arc::new(AtomicBool::new(false)) })
             }

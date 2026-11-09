@@ -325,6 +325,8 @@ struct P {
 @group(0) @binding(5) var<storage, read_write> scores: array<f32>;
 var<workgroup> red: array<f32, 64>;
 
+KVREAD
+
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) tid: u32) {
     let h = wg.x;
@@ -342,10 +344,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     var mx = -3.0e38;
     for (var i = tid; i < len; i += 64u) {
         let slot = (start + i) % p.slots;
-        let kb = (g * p.slots + slot) * hp;
+        let kb = (g * p.slots + slot) * roww();
         var s = 0.0;
         for (var j = 0u; j < hp; j++) {
-            let kk = unpack2x16float(cache[kb + j]);
+            let kk = kv_pair(kb, j);
             s += q[qb + 2u * j] * kk.x + q[qb + 2u * j + 1u] * kk.y;
         }
         if (p.softcap > 0.0) { s = p.softcap * tanh(s / p.softcap); }
@@ -381,7 +383,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
         var acc = vec2<f32>(0.0, 0.0);
         for (var i = 0u; i < len; i++) {
             let slot = (start + i) % p.slots;
-            let vv = unpack2x16float(cache[p.v_off + (g * p.slots + slot) * hp + j]);
+            let vv = kv_pair(p.v_off + (g * p.slots + slot) * roww(), j);
             acc += scores[sb + i] * vv;
         }
         outp[qb + 2u * j] = acc.x * inv;
@@ -436,5 +438,69 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     var v = x[i] * p.inv_scale;
     if (p.softcap > 0.0) { v = p.softcap * tanh(v / p.softcap); }
     x[i] = v;
+}
+"#;
+
+/// KV row readers substituted into ATTENTION (`KVREAD`).
+pub const KVREAD_F16: &str = r#"
+fn roww() -> u32 { return p.hd / 2u; }
+fn kv_pair(base: u32, j: u32) -> vec2<f32> { return unpack2x16float(cache[base + j]); }
+"#;
+
+/// Q8_0 rows: per 32 values one f32 scale word + 8 words of int8.
+pub const KVREAD_Q8: &str = r#"
+fn roww() -> u32 { return p.hd / 32u * 9u; }
+fn kv_pair(base: u32, j: u32) -> vec2<f32> {
+    let e = 2u * j;
+    let w = base + (e / 32u) * 9u;
+    let d = bitcast<f32>(cache[w]);
+    let word = bitcast<i32>(cache[w + 1u + (e % 32u) / 4u]);
+    let sh = 8u * (e % 4u);
+    return vec2<f32>(f32(extractBits(word, sh, 8u)), f32(extractBits(word, sh + 8u, 8u))) * d;
+}
+"#;
+
+/// Store K/V rows into an 8-bit (Q8_0-style) cache: one thread per 32-value block.
+pub const KV_STORE_Q8: &str = r#"
+struct P { n_kv: u32, hd: u32, slots: u32, v_off: u32 };
+@group(0) @binding(1) var<uniform> p: P;
+@group(0) @binding(2) var<storage, read> k: array<f32>;
+@group(0) @binding(3) var<storage, read> v: array<f32>;
+@group(0) @binding(4) var<storage, read_write> cache: array<u32>;
+
+fn quant_word(x0: f32, x1: f32, x2: f32, x3: f32, id: f32) -> u32 {
+    let q0 = u32(clamp(i32(round(x0 * id)), -127, 127)) & 0xFFu;
+    let q1 = u32(clamp(i32(round(x1 * id)), -127, 127)) & 0xFFu;
+    let q2 = u32(clamp(i32(round(x2 * id)), -127, 127)) & 0xFFu;
+    let q3 = u32(clamp(i32(round(x3 * id)), -127, 127)) & 0xFFu;
+    return q0 | (q1 << 8u) | (q2 << 16u) | (q3 << 24u);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let nb = p.hd / 32u;
+    let per_tok = p.n_kv * nb;
+    if (gid.x >= step.n_tok * per_tok) { return; }
+    let t = gid.x / per_tok;
+    let r = gid.x % per_tok;
+    let g = r / nb;
+    let b = r % nb;
+    let slot = (step.pos0 + t) % p.slots;
+    let src = t * p.n_kv * p.hd + g * p.hd + b * 32u;
+    let dst = (g * p.slots + slot) * nb * 9u + b * 9u;
+    var ak = 0.0;
+    var av = 0.0;
+    for (var i = 0u; i < 32u; i++) { ak = max(ak, abs(k[src + i])); av = max(av, abs(v[src + i])); }
+    let dk = ak / 127.0;
+    let dv = av / 127.0;
+    let ik = select(0.0, 1.0 / dk, dk > 0.0);
+    let iv = select(0.0, 1.0 / dv, dv > 0.0);
+    cache[dst] = bitcast<u32>(dk);
+    cache[p.v_off + dst] = bitcast<u32>(dv);
+    for (var w = 0u; w < 8u; w++) {
+        let o = src + 4u * w;
+        cache[dst + 1u + w] = quant_word(k[o], k[o + 1u], k[o + 2u], k[o + 3u], ik);
+        cache[p.v_off + dst + 1u + w] = quant_word(v[o], v[o + 1u], v[o + 2u], v[o + 3u], iv);
+    }
 }
 "#;

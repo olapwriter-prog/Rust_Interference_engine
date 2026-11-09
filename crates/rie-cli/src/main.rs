@@ -76,7 +76,7 @@ struct Common {
     /// Lock model weights in RAM.
     #[arg(long)]
     mlock: bool,
-    /// KV-cache format: f16 or q8_0 (~47% less KV memory). CPU backend only.
+    /// KV-cache format: f16 or q8_0 (~47% less KV memory on CPU, ~44% on GPU).
     #[arg(long, default_value = "f16")]
     kv: String,
 }
@@ -201,7 +201,12 @@ fn build_engine(c: &Common, gguf: Arc<GgufFile>) -> Result<Engine, Box<dyn std::
         {
             Box::new(rie_gpu::GpuBackend::new(
                 model.clone(),
-                rie_gpu::GpuConfig { n_ctx, max_batch: c.batch.min(64), ..Default::default() },
+                rie_gpu::GpuConfig {
+                    n_ctx,
+                    max_batch: c.batch.min(64),
+                    kv_q8: cfg.kv_type == rie_core::KvType::Q8_0,
+                    ..Default::default()
+                },
             )?)
         }
         #[cfg(not(feature = "gpu"))]

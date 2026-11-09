@@ -25,11 +25,13 @@ pub struct GpuConfig {
     pub max_batch: usize,
     /// Prefer a low-power (integrated) adapter; phones only have one anyway.
     pub low_power: bool,
+    /// 8-bit KV cache (Q8_0-style blocks, ~56% of the f16 cache). Needs head_dim % 32 == 0.
+    pub kv_q8: bool,
 }
 
 impl Default for GpuConfig {
     fn default() -> Self {
-        GpuConfig { n_ctx: 4096, max_batch: 32, low_power: false }
+        GpuConfig { n_ctx: 4096, max_batch: 32, low_power: false, kv_q8: false }
     }
 }
 
@@ -225,6 +227,8 @@ const P_HEAD: usize = 7;
 const P_BIAS: usize = 8;
 const P_KV: usize = 9;
 const P_ATT: usize = 10;
+const P_KV_Q8: usize = 14;
+const P_ATT_Q8: usize = 15;
 const P_GLU: usize = 11;
 const P_RES: usize = 12;
 const P_LOGITS: usize = 13;
@@ -288,13 +292,17 @@ impl GpuBackend {
             (shaders::HEAD_PREP, "head_prep"),
             (shaders::BIAS, "bias"),
             (shaders::KV_STORE, "kv_store"),
-            (shaders::ATTENTION, "attention"),
+            (&*shaders::ATTENTION.replace("KVREAD", shaders::KVREAD_F16), "attention"),
             (shaders::GLU, "glu"),
             (shaders::RESIDUAL, "residual"),
             (shaders::LOGITS_POST, "logits_post"),
+            (shaders::KV_STORE_Q8, "kv_store_q8"),
+            (&*shaders::ATTENTION.replace("KVREAD", shaders::KVREAD_Q8), "attention_q8"),
         ] {
             pipelines.push(mk(format!("{}{}", shaders::STEP, src), name));
         }
+        let kv_q8 = cfg.kv_q8 && hd % 32 == 0;
+        let (p_kv, p_att) = if kv_q8 { (P_KV_Q8, P_ATT_Q8) } else { (P_KV, P_ATT) };
 
         // ---- buffers ----
         let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
@@ -431,7 +439,8 @@ impl GpuBackend {
         for (il, lw) in model.layers.iter().enumerate() {
             let swa = c.is_swa(il);
             let slots = if swa { (c.swa_window + max_batch).min(n_ctx) } else { n_ctx };
-            let v_off = c.n_head_kv * slots * hd / 2;
+            let row_words = if kv_q8 { hd / 32 * 9 } else { hd / 2 };
+            let v_off = c.n_head_kv * slots * row_words;
             let cache = new_buf(2 * v_off, "kv");
             vram += 8 * v_off;
             // attention norm
@@ -493,9 +502,9 @@ impl GpuBackend {
             // KV store
             let u = uniform([c.n_head_kv as u32, hd as u32, slots as u32, v_off as u32, 0, 0, 0, 0]);
             dispatches.push(Dispatch {
-                pipeline: P_KV,
-                bind: bind(&pipelines[P_KV], &[&step_buf, &u, &k_buf, &v_buf, &cache]),
-                size: Size::Elems((c.n_head_kv * hd / 2) as u32),
+                pipeline: p_kv,
+                bind: bind(&pipelines[p_kv], &[&step_buf, &u, &k_buf, &v_buf, &cache]),
+                size: Size::Elems((c.n_head_kv * if kv_q8 { hd / 32 } else { hd / 2 }) as u32),
             });
             keep.push(u);
             // attention
@@ -510,8 +519,8 @@ impl GpuBackend {
                 fbits(c.attn_softcap.unwrap_or(0.0)),
             ]);
             dispatches.push(Dispatch {
-                pipeline: P_ATT,
-                bind: bind(&pipelines[P_ATT], &[&step_buf, &u, &q_buf, &cache, &att_buf, &scores_buf]),
+                pipeline: p_att,
+                bind: bind(&pipelines[p_att], &[&step_buf, &u, &q_buf, &cache, &att_buf, &scores_buf]),
                 size: Size::HeadsTok(c.n_head as u32),
             });
             keep.extend([u, cache]);

@@ -172,8 +172,8 @@ cargo test -p rie-core --target aarch64-unknown-linux-gnu   # needs qemu-user + 
   decoding, SME2 kernels (Armv9.2: Dimensity 9500, 8 Elite Gen 5, Apple M4/A19).
 * When the context fills up during generation, the oldest half of the conversation (after
   `n_keep` tokens) is dropped and the rest is re-evaluated, so generation continues
-  (`GenerateParams::context_shift`, on by default). The 8-bit KV cache is CPU-only. The
-  GPU backend keeps f16.
+  (`GenerateParams::context_shift`, on by default). The 8-bit KV cache works on both the CPU
+  and GPU backends.
 
 ## License
 
