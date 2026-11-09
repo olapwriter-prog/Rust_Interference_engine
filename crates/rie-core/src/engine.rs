@@ -5,7 +5,7 @@ use crate::chat::{ChatTemplate, Message};
 use crate::cpu::CpuTopology;
 use crate::error::{bail, Result};
 use crate::gguf::GgufFile;
-use crate::model::cpu::CpuBackend;
+use crate::model::cpu::{CpuBackend, KvType};
 use crate::model::{Backend, Model};
 use crate::sampler::{Sampler, SamplerParams};
 use crate::threadpool::{PoolConfig, ThreadPool};
@@ -28,11 +28,21 @@ pub struct EngineConfig {
     pub spin: Duration,
     /// mlock() the weights (avoids page-out on memory pressure; may need permissions).
     pub mlock: bool,
+    /// KV-cache storage format (Q8_0 roughly halves KV memory).
+    pub kv_type: KvType,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        EngineConfig { n_threads: None, n_ctx: 4096, n_batch: 64, pin_threads: true, spin: Duration::from_micros(300), mlock: false }
+        EngineConfig {
+            n_threads: None,
+            n_ctx: 4096,
+            n_batch: 64,
+            pin_threads: true,
+            spin: Duration::from_micros(300),
+            mlock: false,
+            kv_type: KvType::F16,
+        }
     }
 }
 
@@ -45,6 +55,13 @@ pub struct GenerateParams {
     pub parse_special: bool,
     /// Emit control tokens in the output text.
     pub show_special: bool,
+    /// When the context window fills up during generation, drop the oldest half of the
+    /// tokens after the first `n_keep` and continue (instead of stopping).
+    pub context_shift: bool,
+    /// Tokens at the start of the context that are never discarded (BOS is always kept).
+    pub n_keep: usize,
+    /// Keep generating through end-of-sequence tokens (benchmarks, tests).
+    pub ignore_eos: bool,
 }
 
 impl Default for GenerateParams {
@@ -55,6 +72,9 @@ impl Default for GenerateParams {
             stop_strings: Vec::new(),
             parse_special: true,
             show_special: false,
+            context_shift: true,
+            n_keep: 0,
+            ignore_eos: false,
         }
     }
 }
@@ -150,7 +170,7 @@ impl Engine {
         }
         let n_ctx = cfg.n_ctx.min(model.cfg.ctx_train).max(16);
         let pool = make_pool(&cfg);
-        let backend = CpuBackend::new(model.clone(), pool, n_ctx, cfg.n_batch);
+        let backend = CpuBackend::with_kv_type(model.clone(), pool, n_ctx, cfg.n_batch, cfg.kv_type);
         Ok(Self::with_backend(model, tokenizer, Box::new(backend)))
     }
 
@@ -211,6 +231,26 @@ impl Engine {
         &self.logits
     }
 
+    /// Free space in a full context: keep the first `n_keep` tokens (at least the BOS),
+    /// drop the oldest half of the rest and re-evaluate the remainder so the KV cache is
+    /// consistent with the new positions. Returns `false` if nothing can be dropped.
+    pub fn shift_context(&mut self, n_keep: usize) -> Result<bool> {
+        let n = self.cached.len();
+        let bos = matches!((self.cached.first(), self.tokenizer.bos), (Some(a), Some(b)) if *a == b) as usize;
+        let keep = n_keep.max(bos).min(n);
+        let discard = (n - keep) / 2;
+        if discard == 0 {
+            return Ok(false);
+        }
+        let mut toks = self.cached[..keep].to_vec();
+        toks.extend_from_slice(&self.cached[keep + discard..]);
+        // Positions after `keep` change, so their K/V (with RoPE baked in) must be recomputed;
+        // the shared prefix up to `keep` is reused.
+        self.cached.truncate(keep);
+        self.eval_tokens(&toks)?;
+        Ok(true)
+    }
+
     /// Append one token and evaluate it.
     pub fn eval_next(&mut self, token: u32) -> Result<()> {
         let pos = self.cached.len();
@@ -261,7 +301,7 @@ impl Engine {
             let history_start = self.cached.len().saturating_sub(params.sampler.repeat_last_n);
             let tok = sampler.sample(&mut logits, &self.cached[history_start..]);
             n_gen += 1;
-            if self.tokenizer.is_stop(tok) {
+            if !params.ignore_eos && self.tokenizer.is_stop(tok) {
                 // The stop token is not evaluated; the next chat turn re-renders it as part
                 // of the template and the prefix match resumes from there.
                 stop = StopReason::EndOfSequence;
@@ -302,7 +342,7 @@ impl Engine {
                     break;
                 }
             }
-            if self.cached.len() >= self.backend.n_ctx() {
+            if self.cached.len() >= self.backend.n_ctx() && (!params.context_shift || !self.shift_context(params.n_keep)?) {
                 stop = StopReason::ContextFull;
                 break;
             }

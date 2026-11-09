@@ -20,7 +20,7 @@ rie device                                      # SoC clusters, SIMD features, G
 | Mixed core types (big.LITTLE / DynamIQ) | Reads `/sys` cluster frequencies, `cpu_capacity` and MIDR registers (Cortex-A5xx/A7xx/X-series, Oryon, …), uses **only performance cores** by default, **pins** worker threads to them, and hands out work **dynamically** so faster cores do more of it. Sets QoS *user-interactive* on iOS. |
 | Hundreds of small parallel regions per token | Custom fork/join pool: workers spin briefly between jobs (sub-µs hand-off) and then sleep on a condvar, so idle phones don't burn battery. Q/K/V and gate/up matmuls each run in a single parallel region. |
 | Prompt processing (prefill) is compute-bound | Batched forward pass: each weight block is unpacked once and reused for 4 tokens (dotprod/AVX2) or 2×2 tiles (i8mm). |
-| Limited RAM, apps get killed | Zero-copy **mmap** of the GGUF file (the OS can page weights in and out), optional `mlock`, **f16 KV cache**, and **ring-buffer KV for sliding-window layers** (Gemma 2/3 keep only `window + batch` positions there). |
+| Limited RAM, apps get killed | Zero-copy **mmap** of the GGUF file (the OS can page weights in and out), optional `mlock`, **f16 or 8-bit (Q8_0) KV cache**, and **ring-buffer KV for sliding-window layers** (Gemma 2/3 keep only `window + batch` positions there). |
 | Chat apps re-send the whole conversation | **Prompt-prefix reuse**: only tokens after the longest prefix shared with the previous request are evaluated. |
 | GPUs vary widely (Adreno, Mali, Xclipse, PowerVR, Apple) | `rie-gpu` runs the **entire forward pass in portable WGSL** via wgpu (Vulkan on Android, Metal on iOS). No f16 or subgroup extensions needed; weights are uploaded once and only the logits come back to the CPU. |
 
@@ -134,6 +134,7 @@ engine.chat(&[Message::new(Role::User, "Hello")], &GenerateParams::default(), |t
 | `--threads` / `n_threads` | number of performance cores (max 8) | Token generation is limited by memory bandwidth; 4–6 threads is often the sweet spot. Try `rie bench -t N`. |
 | `--ctx` | 4096 | KV memory = 2 × layers × kv_heads × head_dim × ctx × 2 bytes |
 | `--batch` | 64 | Prompt chunk size; larger is faster prefill but uses more scratch memory |
+| `--kv q8_0` | f16 | 8-bit KV cache: ~47% less KV memory (logits within ~2% of f16) |
 | `--no-pin` | pinning on | Disable if the OS restricts affinity |
 | `RIE_DISABLE=i8mm,dotprod,neon,avx2,simd` | — | Force slower kernels (A/B testing, debugging) |
 
@@ -167,10 +168,12 @@ cargo test -p rie-core --target aarch64-unknown-linux-gnu   # needs qemu-user + 
   prefill and frees up the CPU. On the GPU, formats other than F16/Q8_0/Q4_0/Q4_K/Q6_K are
   converted to Q8_0 at load time.
 * Not supported yet: MoE models (Qwen3-30B-A3B, gpt-oss), vision/audio towers, YaRN
-  beyond the trained context, IQ*/TQ* quantizations, KV-cache quantization, speculative
+  beyond the trained context, IQ*/TQ* quantizations, speculative
   decoding, SME2 kernels (Armv9.2: Dimensity 9500, 8 Elite Gen 5, Apple M4/A19).
-* Running past the end of the context stops generation (`StopReason::ContextFull`). There
-  is no automatic context shifting yet.
+* When the context fills up during generation, the oldest half of the conversation (after
+  `n_keep` tokens) is dropped and the rest is re-evaluated, so generation continues
+  (`GenerateParams::context_shift`, on by default). The 8-bit KV cache is CPU-only. The
+  GPU backend keeps f16.
 
 ## License
 

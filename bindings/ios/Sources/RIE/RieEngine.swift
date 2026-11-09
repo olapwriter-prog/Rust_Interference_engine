@@ -35,11 +35,12 @@ public final class RieEngine {
     /// - Parameters:
     ///   - threads: 0 = auto (P-cores)
     ///   - useGPU: Metal backend (library built with the `gpu` feature)
-    public init(modelPath: String, threads: Int = 0, contextSize: Int = 4096, useGPU: Bool = false) throws {
+    public init(modelPath: String, threads: Int = 0, contextSize: Int = 4096, useGPU: Bool = false, kvQ8: Bool = false) throws {
         var cfg = rie_default_config()
         cfg.n_threads = Int32(threads)
         cfg.n_ctx = Int32(contextSize)
         cfg.use_gpu = useGPU ? 1 : 0
+        cfg.kv_q8 = kvQ8 ? 1 : 0
         var err = [CChar](repeating: 0, count: 512)
         guard let h = rie_load(modelPath, &cfg, &err, err.count) else {
             throw EngineError(description: String(cString: err))

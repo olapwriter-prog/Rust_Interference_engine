@@ -23,6 +23,7 @@ pub extern "system" fn Java_ai_rie_RieEngine_nativeLoad(
     n_threads: jint,
     n_ctx: jint,
     use_gpu: jboolean,
+    kv_q8: jboolean,
 ) -> jlong {
     let path: String = match env.get_string(&path) {
         Ok(s) => s.into(),
@@ -37,6 +38,7 @@ pub extern "system" fn Java_ai_rie_RieEngine_nativeLoad(
         cfg.n_ctx = n_ctx;
     }
     cfg.use_gpu = use_gpu as i32;
+    cfg.kv_q8 = kv_q8 as i32;
     match load_engine(&path, &cfg) {
         Ok(e) => Box::into_raw(Box::new(e)) as jlong,
         Err(m) => {

@@ -35,6 +35,7 @@ pub mod tokenizer;
 pub use engine::{Engine, EngineConfig, GenerateParams, GenerationStats, StopReason};
 pub use error::{Error, Result};
 pub use kernels::CpuFeatures;
+pub use model::cpu::KvType;
 pub use model::{Backend, ModelConfig};
 pub use sampler::{Sampler, SamplerParams};
 pub use tokenizer::Tokenizer;

@@ -31,6 +31,8 @@ pub struct RieConfig {
     pub use_gpu: i32,
     pub pin_threads: i32,
     pub mlock: i32,
+    /// 0 = f16 KV cache, 1 = Q8_0 KV cache (~47% less memory).
+    pub kv_q8: i32,
 }
 
 #[repr(C)]
@@ -62,7 +64,7 @@ pub type RieTokenCallback = Option<unsafe extern "C" fn(piece: *const c_char, us
 
 #[no_mangle]
 pub extern "C" fn rie_default_config() -> RieConfig {
-    RieConfig { n_threads: 0, n_ctx: 4096, n_batch: 64, use_gpu: 0, pin_threads: 1, mlock: 0 }
+    RieConfig { n_threads: 0, n_ctx: 4096, n_batch: 64, use_gpu: 0, pin_threads: 1, mlock: 0, kv_q8: 0 }
 }
 
 #[no_mangle]
@@ -99,6 +101,7 @@ pub(crate) fn load_engine(path: &str, cfg: &RieConfig) -> Result<RieEngine, Stri
         n_batch: if cfg.n_batch > 0 { cfg.n_batch as usize } else { 64 },
         pin_threads: cfg.pin_threads != 0,
         mlock: cfg.mlock != 0,
+        kv_type: if cfg.kv_q8 != 0 { rie_core::KvType::Q8_0 } else { rie_core::KvType::F16 },
         ..Default::default()
     };
     if ecfg.mlock {
@@ -114,7 +117,7 @@ pub(crate) fn load_engine(path: &str, cfg: &RieConfig) -> Result<RieEngine, Stri
             Err(e) => eprintln!("rie: GPU backend unavailable ({e}), falling back to CPU"),
         }
     }
-    let backend = CpuBackend::new(model.clone(), make_pool(&ecfg), n_ctx, ecfg.n_batch);
+    let backend = CpuBackend::with_kv_type(model.clone(), make_pool(&ecfg), n_ctx, ecfg.n_batch, ecfg.kv_type);
     Ok(RieEngine { engine: Engine::with_backend(model, tok, Box::new(backend)), cancel: Arc::new(AtomicBool::new(false)) })
 }
 

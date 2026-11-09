@@ -76,6 +76,9 @@ struct Common {
     /// Lock model weights in RAM.
     #[arg(long)]
     mlock: bool,
+    /// KV-cache format: f16 or q8_0 (~47% less KV memory). CPU backend only.
+    #[arg(long, default_value = "f16")]
+    kv: String,
 }
 
 #[derive(Args)]
@@ -171,7 +174,18 @@ struct BenchArgs {
 }
 
 fn engine_config(c: &Common) -> EngineConfig {
-    EngineConfig { n_threads: c.threads, n_ctx: c.ctx, n_batch: c.batch, pin_threads: !c.no_pin, mlock: c.mlock, ..Default::default() }
+    EngineConfig {
+        n_threads: c.threads,
+        n_ctx: c.ctx,
+        n_batch: c.batch,
+        pin_threads: !c.no_pin,
+        mlock: c.mlock,
+        kv_type: rie_core::KvType::parse(&c.kv).unwrap_or_else(|| {
+            eprintln!("unknown --kv '{}', using f16", c.kv);
+            rie_core::KvType::F16
+        }),
+        ..Default::default()
+    }
 }
 
 fn build_engine(c: &Common, gguf: Arc<GgufFile>) -> Result<Engine, Box<dyn std::error::Error>> {
@@ -195,7 +209,7 @@ fn build_engine(c: &Common, gguf: Arc<GgufFile>) -> Result<Engine, Box<dyn std::
             return Err("this binary was built without GPU support (rebuild with --features gpu)".into());
         }
     } else {
-        Box::new(CpuBackend::new(model.clone(), make_pool(&cfg), n_ctx, cfg.n_batch))
+        Box::new(CpuBackend::with_kv_type(model.clone(), make_pool(&cfg), n_ctx, cfg.n_batch, cfg.kv_type))
     };
     let e = Engine::with_backend(model, tok, backend);
     eprintln!(

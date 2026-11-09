@@ -366,3 +366,64 @@ fn engine_generation_prefix_reuse_and_determinism() {
     assert_eq!(ids[0], 1);
     assert_eq!(tok.decode(&ids[1..], false).trim_start(), "héllo phone");
 }
+
+#[test]
+fn q8_0_kv_cache_matches_f16_kv_cache() {
+    use rie_core::KvType;
+    for (arch, ty) in
+        [("llama", GgmlType::F16), ("qwen3", GgmlType::F16), ("gemma3", GgmlType::F16), ("phi3", GgmlType::Q4_0), ("llama", GgmlType::Q4_K)]
+    {
+        let spec = SyntheticSpec::tiny(arch, ty);
+        let (model, _) = load_model_from(Arc::new(GgufFile::from_bytes(spec.build()).unwrap())).unwrap();
+        let pool = Arc::new(ThreadPool::new(PoolConfig { n_threads: 3, cores: vec![], spin: Duration::from_micros(50) }));
+        let mut a = CpuBackend::with_kv_type(model.clone(), pool.clone(), 64, 4, KvType::F16);
+        let mut b = CpuBackend::with_kv_type(model.clone(), pool, 64, 4, KvType::Q8_0);
+        assert_eq!(b.kv_type(), KvType::Q8_0);
+        assert!(b.kv_bytes() * 100 < a.kv_bytes() * 54, "Q8_0 KV should be ~53% of F16");
+        let nv = spec.n_vocab;
+        let tokens: Vec<u32> = (0..14u32).map(|i| (i * 29 + 3) % nv as u32).collect();
+        let (mut la, mut lb) = (vec![0.0; nv], vec![0.0; nv]);
+        let mut pos = 0;
+        let mut worst = 0.0f32;
+        while pos < tokens.len() {
+            let end = (pos + 4).min(tokens.len());
+            a.forward(&tokens[pos..end], pos, false, &mut la).unwrap();
+            b.forward(&tokens[pos..end], pos, false, &mut lb).unwrap();
+            worst = worst.max(max_rel_err(&lb, &la));
+            pos = end;
+        }
+        eprintln!("{arch} {ty:?}: Q8_0-KV vs F16-KV max rel err {worst}");
+        assert!(worst < 0.05, "{arch} {ty:?}: {worst}");
+    }
+}
+
+#[test]
+fn context_shift_keeps_generating_and_is_consistent() {
+    let spec = SyntheticSpec::tiny("llama", GgmlType::F16);
+    let (model, tok) = load_model_from(Arc::new(GgufFile::from_bytes(spec.build()).unwrap())).unwrap();
+    let pool = Arc::new(ThreadPool::new(PoolConfig { n_threads: 2, cores: vec![], spin: Duration::from_micros(50) }));
+    let mk = || Engine::with_backend(model.clone(), tok.clone(), Box::new(CpuBackend::new(model.clone(), pool.clone(), 32, 8)));
+    // generation runs past the 32-token window
+    let mut e = mk();
+    let params = GenerateParams { max_tokens: 100, sampler: SamplerParams::greedy(), ignore_eos: true, ..Default::default() };
+    let st = e.generate("the phone", &params, |_| true).unwrap();
+    assert_eq!(st.generated_tokens, 100);
+    assert_eq!(st.stop, rie_core::StopReason::MaxTokens);
+    assert!(e.n_cached() <= 32);
+    // without shifting it stops at the window
+    let mut e = mk();
+    let st = e.generate("the phone", &GenerateParams { context_shift: false, ..params.clone() }, |_| true).unwrap();
+    assert_eq!(st.stop, rie_core::StopReason::ContextFull);
+    // after a shift the cache state equals a fresh evaluation of the kept tokens
+    let mut e = mk();
+    let toks: Vec<u32> = std::iter::once(1).chain((0..31u32).map(|i| 3 + (i * 7) % 300)).collect();
+    e.eval_tokens(&toks).unwrap();
+    assert!(e.shift_context(4).unwrap());
+    let kept: Vec<u32> = toks[..4].iter().chain(&toks[4 + 14..]).copied().collect();
+    assert_eq!(e.n_cached(), kept.len());
+    let shifted = e.logits().to_vec();
+    let mut fresh = mk();
+    fresh.eval_tokens(&kept).unwrap();
+    let err = max_rel_err(&shifted, fresh.logits());
+    assert!(err < 1e-4, "shifted vs fresh: {err}");
+}

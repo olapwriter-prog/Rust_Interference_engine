@@ -3,17 +3,43 @@
 use super::{Activation, Backend, Model};
 use crate::error::{bail, Result};
 use crate::kernels::matmul::{formats_for, matmul, matmul_multi, MatmulJob, QuantActs, SyncPtr};
-use crate::kernels::{axpy_f16, dot_f16_f32, f32_to_f16_slice};
+use crate::kernels::{axpy_f16, dot_f16_f32, f32_to_f16_slice, fp16_to_f32, vec_dot, ActRow};
 use crate::ops::{gelu_tanh, rmsnorm, rmsnorm_inplace, silu, Rope};
+use crate::quant::{quantize_row_q8_0, BlockQ8_0, GgmlType, QK};
 use crate::threadpool::ThreadPool;
 use std::sync::Arc;
 
-/// Per-layer KV storage, layout `[kv_head][slot][head_dim]` as f16 bits.
+/// Storage format of the KV cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KvType {
+    /// 16-bit floats (2 bytes / value).
+    #[default]
+    F16,
+    /// ggml Q8_0 blocks (1.06 bytes / value): ~47% less memory, slightly lower precision.
+    /// Attention scores then use the int8 dot-product kernels.
+    Q8_0,
+}
+
+impl KvType {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "f16" => Some(KvType::F16),
+            "q8" | "q8_0" => Some(KvType::Q8_0),
+            _ => None,
+        }
+    }
+}
+
+/// Per-layer KV storage, layout `[kv_head][slot][head_dim]`, as f16 bits (`k`/`v`) or as
+/// Q8_0 blocks (`kq`/`vq`, `head_dim / 32 * 34` bytes per row).
 /// Sliding-window layers use a ring buffer of `window + max_batch` slots.
 struct LayerCache {
     k: Vec<u16>,
     v: Vec<u16>,
+    kq: Vec<u8>,
+    vq: Vec<u8>,
     slots: usize,
+    ty: KvType,
 }
 
 pub struct CpuBackend {
@@ -44,13 +70,29 @@ pub struct CpuBackend {
 
 impl CpuBackend {
     pub fn new(model: Arc<Model>, pool: Arc<ThreadPool>, n_ctx: usize, max_batch: usize) -> Self {
+        Self::with_kv_type(model, pool, n_ctx, max_batch, KvType::F16)
+    }
+
+    /// Like [`CpuBackend::new`] with a chosen KV-cache format. Q8_0 requires a head
+    /// dimension divisible by 32 and falls back to F16 otherwise.
+    pub fn with_kv_type(model: Arc<Model>, pool: Arc<ThreadPool>, n_ctx: usize, max_batch: usize, kv: KvType) -> Self {
         let c = &model.cfg;
         let max_batch = max_batch.clamp(1, n_ctx.max(1));
+        let kv = if kv == KvType::Q8_0 && c.head_dim % QK != 0 { KvType::F16 } else { kv };
         let cache = (0..c.n_layer)
             .map(|il| {
                 let slots = if c.is_swa(il) { (c.swa_window + max_batch).min(n_ctx) } else { n_ctx };
-                let n = c.n_head_kv * slots * c.head_dim;
-                LayerCache { k: vec![0; n], v: vec![0; n], slots }
+                let rows = c.n_head_kv * slots;
+                match kv {
+                    KvType::F16 => {
+                        let n = rows * c.head_dim;
+                        LayerCache { k: vec![0; n], v: vec![0; n], kq: Vec::new(), vq: Vec::new(), slots, ty: kv }
+                    }
+                    KvType::Q8_0 => {
+                        let n = rows * GgmlType::Q8_0.row_bytes(c.head_dim);
+                        LayerCache { k: Vec::new(), v: Vec::new(), kq: vec![0; n], vq: vec![0; n], slots, ty: kv }
+                    }
+                }
             })
             .collect();
         let rope_global = Rope::new(c.rope_dim, c.rope_neox, c.rope_base, c.rope_freq_scale, model.rope_factors.as_deref());
@@ -85,7 +127,11 @@ impl CpuBackend {
 
     /// Bytes used by the KV cache.
     pub fn kv_bytes(&self) -> usize {
-        self.cache.iter().map(|c| (c.k.len() + c.v.len()) * 2).sum()
+        self.cache.iter().map(|c| (c.k.len() + c.v.len()) * 2 + c.kq.len() + c.vq.len()).sum()
+    }
+
+    pub fn kv_type(&self) -> KvType {
+        self.cache.first().map(|c| c.ty).unwrap_or_default()
     }
 
     pub fn pool(&self) -> &Arc<ThreadPool> {
@@ -181,9 +227,21 @@ impl CpuBackend {
             for t in 0..n {
                 let slot = (pos0 + t) % lc.slots;
                 for h in 0..c.n_head_kv {
-                    let dst = (h * lc.slots + slot) * hd;
-                    f32_to_f16_slice(&self.k[t * kvd + h * hd..t * kvd + (h + 1) * hd], &mut lc.k[dst..dst + hd]);
-                    f32_to_f16_slice(&self.v[t * kvd + h * hd..t * kvd + (h + 1) * hd], &mut lc.v[dst..dst + hd]);
+                    let ks = &self.k[t * kvd + h * hd..t * kvd + (h + 1) * hd];
+                    let vs = &self.v[t * kvd + h * hd..t * kvd + (h + 1) * hd];
+                    let row = h * lc.slots + slot;
+                    match lc.ty {
+                        KvType::F16 => {
+                            let dst = row * hd;
+                            f32_to_f16_slice(ks, &mut lc.k[dst..dst + hd]);
+                            f32_to_f16_slice(vs, &mut lc.v[dst..dst + hd]);
+                        }
+                        KvType::Q8_0 => {
+                            let rb = GgmlType::Q8_0.row_bytes(hd);
+                            store_q8_0(ks, &mut lc.kq[row * rb..(row + 1) * rb]);
+                            store_q8_0(vs, &mut lc.vq[row * rb..(row + 1) * rb]);
+                        }
+                    }
                 }
             }
             let window = if swa { c.swa_window } else { 0 };
@@ -340,12 +398,21 @@ fn attention(
         let len = p + 1 - start;
         let qh = &q[t * qd + h * hd..t * qd + (h + 1) * hd];
         let sc = unsafe { std::slice::from_raw_parts_mut(sc_p.get().add(tid * n_ctx), len) };
-        let kbase = &cache.k[g * slots * hd..(g + 1) * slots * hd];
-        let vbase = &cache.v[g * slots * hd..(g + 1) * slots * hd];
+        let rb = GgmlType::Q8_0.row_bytes(hd);
+        // For the Q8_0 cache the query is quantized once so scores use int8 dot kernels.
+        let mut qq = [BlockQ8_0::default(); 16];
+        let nqb = hd / QK;
+        if cache.ty == KvType::Q8_0 {
+            quantize_row_q8_0(qh, &mut qq[..nqb]);
+        }
         let mut max = f32::NEG_INFINITY;
         for (i, s) in sc.iter_mut().enumerate() {
             let slot = (start + i) % slots;
-            let mut v = dot_f16_f32(&kbase[slot * hd..(slot + 1) * hd], qh);
+            let row = g * slots + slot;
+            let mut v = match cache.ty {
+                KvType::F16 => dot_f16_f32(&cache.k[row * hd..(row + 1) * hd], qh),
+                KvType::Q8_0 => vec_dot(GgmlType::Q8_0, &cache.kq[row * rb..(row + 1) * rb], ActRow::Q8_0(&qq[..nqb]), hd),
+            };
             if let Some(cap) = softcap {
                 v = cap * (v / cap).tanh();
             }
@@ -361,8 +428,35 @@ fn attention(
         let o = unsafe { std::slice::from_raw_parts_mut(out_p.get().add(t * qd + h * hd), hd) };
         o.fill(0.0);
         for (i, &s) in sc.iter().enumerate() {
-            let slot = (start + i) % slots;
-            axpy_f16(o, s * inv, &vbase[slot * hd..(slot + 1) * hd]);
+            let row = g * slots + (start + i) % slots;
+            match cache.ty {
+                KvType::F16 => axpy_f16(o, s * inv, &cache.v[row * hd..(row + 1) * hd]),
+                KvType::Q8_0 => axpy_q8_0(o, s * inv, &cache.vq[row * rb..(row + 1) * rb]),
+            }
         }
     });
+}
+
+/// Quantize one head vector into Q8_0 blocks (ggml layout).
+fn store_q8_0(x: &[f32], dst: &mut [u8]) {
+    for (xb, ob) in x.chunks_exact(QK).zip(dst.chunks_exact_mut(34)) {
+        let amax = xb.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let d = amax / 127.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        ob[..2].copy_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+        for (q, &v) in ob[2..].iter_mut().zip(xb) {
+            *q = ((v * id).round() as i32).clamp(-127, 127) as i8 as u8;
+        }
+    }
+}
+
+/// `y += a * dequant(row)` for a Q8_0 row.
+#[inline]
+fn axpy_q8_0(y: &mut [f32], a: f32, row: &[u8]) {
+    for (yb, b) in y.chunks_exact_mut(QK).zip(row.chunks_exact(34)) {
+        let s = a * fp16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+        for (o, &q) in yb.iter_mut().zip(&b[2..]) {
+            *o += s * (q as i8) as f32;
+        }
+    }
 }

@@ -63,14 +63,15 @@ class RieEngine private constructor(private var handle: Long) : Closeable {
         /**
          * @param threads 0 = auto (performance cores only, pinned)
          * @param useGpu run on the Vulkan GPU backend (library built with `--features gpu`)
+         * @param kvQ8 8-bit KV cache: ~47% less memory for long conversations
          */
         @JvmStatic
-        fun load(path: String, threads: Int = 0, contextSize: Int = 4096, useGpu: Boolean = false): RieEngine =
-            RieEngine(nativeLoad(path, threads, contextSize, useGpu))
+        fun load(path: String, threads: Int = 0, contextSize: Int = 4096, useGpu: Boolean = false, kvQ8: Boolean = false): RieEngine =
+            RieEngine(nativeLoad(path, threads, contextSize, useGpu, kvQ8))
 
         @JvmStatic val deviceInfo: String get() = nativeDeviceInfo()
 
-        @JvmStatic private external fun nativeLoad(path: String, threads: Int, ctx: Int, gpu: Boolean): Long
+        @JvmStatic private external fun nativeLoad(path: String, threads: Int, ctx: Int, gpu: Boolean, kvQ8: Boolean): Long
         @JvmStatic private external fun nativeFree(h: Long)
         @JvmStatic private external fun nativeCancel(h: Long)
         @JvmStatic private external fun nativeReset(h: Long)
