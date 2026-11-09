@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/rie-core"]
-default-members = ["crates/rie-core"]
+members = ["crates/rie-core", "crates/rie-cli", "crates/rie-gpu"]
+default-members = ["crates/rie-core", "crates/rie-cli", "crates/rie-gpu"]
 
 [workspace.package]
 version = "0.1.0"

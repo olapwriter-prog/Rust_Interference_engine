@@ -1,0 +1,13 @@
+[package]
+name = "rie-gpu"
+description = "GPU backend for the Rust Inference Engine: full transformer forward pass in WGSL compute shaders (Vulkan on Android, Metal on iOS)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rie-core = { workspace = true }
+wgpu = { version = "30", default-features = false, features = ["wgsl", "vulkan", "metal", "std"] }
+pollster = "0.4"
+half = { workspace = true }

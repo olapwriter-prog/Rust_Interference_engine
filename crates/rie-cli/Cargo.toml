@@ -1,0 +1,20 @@
+[package]
+name = "rie-cli"
+description = "Command-line interface for the Rust Inference Engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rie"
+path = "src/main.rs"
+
+[features]
+default = []
+gpu = ["dep:rie-gpu"]
+
+[dependencies]
+rie-core = { workspace = true }
+rie-gpu = { workspace = true, optional = true }
+clap = { version = "4.5", features = ["derive"] }
