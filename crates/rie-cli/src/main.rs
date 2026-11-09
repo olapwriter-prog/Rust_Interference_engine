@@ -33,6 +33,15 @@ enum Cmd {
     Info { model: PathBuf },
     /// Show CPU topology, SIMD features and GPUs.
     Device,
+    /// Write a synthetic model (random weights, real shapes) to a GGUF file for testing.
+    Synth {
+        /// Preset name (see `bench --synthetic`) or "tiny-<arch>".
+        preset: String,
+        #[arg(long, default_value = "Q4_0")]
+        wtype: String,
+        #[arg(short, long)]
+        out: PathBuf,
+    },
     /// Compute perplexity over a text file.
     Perplexity {
         #[command(flatten)]
@@ -338,6 +347,15 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
             println!("| {name} {} | {} | pp{} | {:.2} |", e.model.main_type().name(), e.backend_name(), a.n_prompt, mean(&pp));
             println!("| {name} {} | {} | tg{} | {:.2} |", e.model.main_type().name(), e.backend_name(), a.n_gen, mean(&tg));
+        }
+        Cmd::Synth { preset, wtype, out } => {
+            let wtype = parse_type(&wtype)?;
+            let spec = match preset.strip_prefix("tiny-") {
+                Some(arch) => SyntheticSpec::tiny(arch, wtype),
+                None => SyntheticSpec::preset(&preset, wtype).ok_or("unknown preset")?,
+            };
+            std::fs::write(&out, spec.build())?;
+            println!("wrote {}", out.display());
         }
         Cmd::Perplexity { common, file, windows } => {
             let mut e = build_engine(&common, open_model(&common)?)?;

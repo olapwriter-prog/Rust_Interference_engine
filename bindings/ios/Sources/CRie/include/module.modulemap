@@ -1,0 +1,5 @@
+module CRie {
+    header "rie.h"
+    link "rie"
+    export *
+}

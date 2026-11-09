@@ -1,0 +1,21 @@
+[package]
+name = "rie-ffi"
+description = "C ABI, Android JNI and iOS bindings for the Rust Inference Engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "rie"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+default = ["jni"]
+gpu = ["dep:rie-gpu"]
+jni = ["dep:jni"]
+
+[dependencies]
+rie-core = { workspace = true }
+rie-gpu = { workspace = true, optional = true }
+jni = { version = "=0.21.1", optional = true, default-features = false }
