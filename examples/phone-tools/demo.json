@@ -1,0 +1,279 @@
+{
+  "tools": [
+    {
+      "name": "weather.current",
+      "description": "Current weather and forecast for a city",
+      "command": [
+        "python3",
+        "demo_tools.py",
+        "weather"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string",
+            "description": "city name"
+          }
+        },
+        "required": [
+          "city"
+        ]
+      }
+    },
+    {
+      "name": "calendar.today",
+      "description": "Today's calendar events",
+      "command": [
+        "python3",
+        "demo_tools.py",
+        "calendar"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "tasks.due",
+      "description": "Open tasks and to-dos due today",
+      "command": [
+        "python3",
+        "demo_tools.py",
+        "tasks"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "bank.balance",
+      "description": "Bank account balance",
+      "command": [
+        "python3",
+        "demo_tools.py",
+        "balance"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "bank.spending",
+      "description": "Spending by category this month",
+      "category": "finance",
+      "command": [
+        "python3",
+        "demo_tools.py",
+        "spending"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "news.headlines",
+      "description": "Top local news headlines",
+      "command": [
+        "python3",
+        "demo_tools.py",
+        "news"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "files.search",
+      "description": "Search documents and files on the phone",
+      "command": [
+        "python3",
+        "demo_tools.py",
+        "files"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "device.battery",
+      "description": "Phone battery level and status",
+      "command": [
+        "python3",
+        "demo_tools.py",
+        "battery"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "health.steps",
+      "description": "Steps walked today",
+      "category": "health",
+      "command": [
+        "python3",
+        "demo_tools.py",
+        "steps"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "location.current",
+      "description": "Current location of the phone",
+      "category": "travel",
+      "command": [
+        "python3",
+        "demo_tools.py",
+        "location"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "messages.recent",
+      "description": "Recent SMS and chat messages",
+      "command": [
+        "python3",
+        "demo_tools.py",
+        "messages"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "transit.status",
+      "description": "Public transport status and delays",
+      "category": "travel",
+      "command": [
+        "python3",
+        "demo_tools.py",
+        "fail"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "timeout_ms": 3000
+    },
+    {
+      "name": "traffic.live",
+      "description": "Live traffic on the route to work",
+      "category": "travel",
+      "command": [
+        "python3",
+        "demo_tools.py",
+        "slow"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "timeout_ms": 800
+    },
+    {
+      "name": "notes.raw",
+      "description": "Read the scratch notes file",
+      "category": "files",
+      "command": [
+        "python3",
+        "demo_tools.py",
+        "text"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "web.preview",
+      "description": "Preview a web page title and body",
+      "category": "web",
+      "command": [
+        "python3",
+        "demo_tools.py",
+        "html"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "logs.dump",
+      "description": "Dump the full system log",
+      "category": "device",
+      "command": [
+        "python3",
+        "demo_tools.py",
+        "big"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "debug.echo",
+      "description": "Echo back the arguments it receives",
+      "command": [
+        "python3",
+        "demo_tools.py",
+        "echo"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "unit": {
+            "type": "string",
+            "enum": [
+              "c",
+              "f"
+            ]
+          },
+          "count": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "unit",
+          "count"
+        ]
+      }
+    }
+  ]
+}

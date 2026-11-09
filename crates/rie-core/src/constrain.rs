@@ -402,12 +402,13 @@ impl JsonConstraint {
                 };
             }
             Lex::Num { phase, len, integer, exp_digits, int_digits } => {
+                // the length cap applies to the number's own characters, not to the
+                // byte that terminates it (otherwise a number of exactly MAX_NUMBER
+                // characters could never be closed)
                 *len += 1;
-                if *len > MAX_NUMBER {
-                    return false;
-                }
+                let too_long = *len > MAX_NUMBER;
                 let integer = *integer;
-                if b.is_ascii_digit() {
+                if b.is_ascii_digit() && !too_long {
                     match phase {
                         NumPhase::Exp | NumPhase::ExpSign | NumPhase::ExpDigits => {
                             *exp_digits += 1;
@@ -436,6 +437,9 @@ impl JsonConstraint {
                     _ => None,
                 };
                 if let Some(n) = next {
+                    if too_long {
+                        return false;
+                    }
                     *phase = n;
                     return true;
                 }
@@ -757,6 +761,22 @@ mod tests {
         }
         assert!(c.is_complete(), "did not finish: {}", String::from_utf8_lossy(&out));
         assert!(out.len() < 400, "{}", String::from_utf8_lossy(&out));
+    }
+
+    #[test]
+    fn number_at_the_length_cap_can_still_be_closed() {
+        let sig = ToolSig {
+            name: "f".into(),
+            args: vec![("x".into(), ArgType::Number), ("y".into(), ArgType::Integer)],
+            required: vec![],
+            enums: vec![],
+        };
+        let mut c = JsonConstraint::tool_call(Arc::new(vec![sig]), "arguments");
+        let digits = "5".repeat(MAX_NUMBER);
+        assert!(c.feed(format!("{{\"name\":\"f\",\"arguments\":{{\"x\":{digits}").as_bytes()));
+        assert!(!c.accepts(b"5"), "cap reached");
+        assert!(c.accepts(b",") && c.accepts(b"}") && c.accepts(b" "), "terminators stay allowed");
+        assert!(c.feed(b"}}") && c.is_complete());
     }
 
     #[test]

@@ -85,6 +85,11 @@ harnesses such as the stitaP tool harness:
   failures (*limitations*) and the arguments that worked (*expectations*) are learned from
   the results and kept as Markdown cards (`DIR/tools/NAME.md`, hand-editable) that are
   shown to the model. `--tool-recall K` offers only the K tools most relevant to the request.
+- **Ask the phone** (`POST /v1/ask`, `--headless-tools FILE`): runs every relevant
+  headless tool (Termux:API phone data, scripts, local HTTP services) in parallel, with
+  model-filled, schema-valid arguments. The results are rendered as one categorized
+  answer page in a fixed style: HTML, a JSON spec for native views, and Markdown. See
+  [docs/ask-the-phone.md](docs/ask-the-phone.md).
 - **Phones:** included in the static ARM64 build, so it runs in Termux next to the agent.
 
 See [docs/tool-harness.md](docs/tool-harness.md).

@@ -16,9 +16,11 @@
 //!   `/health`, `/props` and llama.cpp-style `timings`, so harnesses that launch
 //!   `llama-server` themselves can launch `rie-server` instead.
 
+pub mod headless;
 pub mod http;
 pub mod toolbook;
 pub mod tools;
+pub mod ui;
 
 use rie_core::constrain::{ArgType, ToolSig};
 use rie_core::engine::{load_model, make_pool, Engine, EngineConfig, GenerateParams};
@@ -78,6 +80,8 @@ pub struct ServerConfig {
     pub memory_tool: bool,
     /// Show only the K tools most relevant to the request (0 = all).
     pub tool_recall: usize,
+    /// Manifest of headless tools the server runs itself for `/v1/ask`.
+    pub headless: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -108,6 +112,7 @@ impl Default for ServerConfig {
             recall: 3,
             memory_tool: true,
             tool_recall: 0,
+            headless: None,
         }
     }
 }
@@ -139,7 +144,13 @@ pub struct State {
     /// tool_call_ids already learned from (conversations are resent with every request)
     observed: HashSet<String>,
     observed_order: VecDeque<String>,
+    /// headless tools for `/v1/ask`
+    pub headless: Vec<headless::HeadlessTool>,
+    /// recently generated answer pages (id, page)
+    pages: VecDeque<(String, ui::Page)>,
 }
+
+const MAX_PAGES: usize = 32;
 
 /// Name of the built-in memory tool.
 pub const RECALL_TOOL: &str = "recall_memory";
@@ -179,7 +190,17 @@ impl State {
                 None
             }
         });
-        let toolbook = cfg.memory.as_ref().map(|d| ToolBook::open(d.clone())).unwrap_or_else(ToolBook::in_memory);
+        let mut toolbook = cfg.memory.as_ref().map(|d| ToolBook::open(d.clone())).unwrap_or_else(ToolBook::in_memory);
+        let headless = match &cfg.headless {
+            Some(p) => headless::load_manifest(p).unwrap_or_else(|e| {
+                eprintln!("rie-server: headless tools disabled: {e}");
+                Vec::new()
+            }),
+            None => Vec::new(),
+        };
+        if toolbook.harvest(&headless.iter().map(|t| t.schema()).collect::<Vec<_>>()) {
+            toolbook.save();
+        }
         State {
             engine,
             cfg,
@@ -192,6 +213,43 @@ impl State {
             toolbook,
             observed: HashSet::new(),
             observed_order: VecDeque::new(),
+            headless,
+            pages: VecDeque::new(),
+        }
+    }
+
+    /// Let the model fill one tool's arguments (grammar-constrained, so always valid).
+    fn tool_args(&mut self, question: &str, tool: &headless::HeadlessTool) -> Result<Value, String> {
+        if !tool.has_params() {
+            return Ok(json!({}));
+        }
+        let schema = tool.schema();
+        let (_, sigs) = parse_tools(Some(&json!([schema.clone()])));
+        let notes = self.toolbook.notes(std::slice::from_ref(&tool.name));
+        let mut system =
+            "You are an assistant running on the user's phone. Call the tool with the arguments that best answer the request.".to_string();
+        if !notes.is_empty() {
+            system.push_str(&format!("\n\nWhat you learned about this tool:\n{notes}"));
+        }
+        let msgs = vec![
+            ApiMessage { role: "system".into(), content: system, ..Default::default() },
+            ApiMessage { role: "user".into(), content: question.to_string(), ..Default::default() },
+        ];
+        let template = self.engine.template;
+        let format = CallFormat::for_template(template);
+        let mut prompt = render(template, &msgs, &[schema], true);
+        prompt.push_str(format.call_prefix());
+        let tokens = self.engine.tokenize(&prompt, true, true);
+        let mut filter = ToolCallFilter::with_limits(format, sigs, true, true, self.cfg.max_string.min(256), 2048);
+        let params = GenerateParams { max_tokens: 256, ..Default::default() };
+        let res = self.engine.generate_hooked(&tokens, &params, &mut filter, &mut |_: &str| true);
+        let _ = self.engine.take_trajectory();
+        match res {
+            Err(e) => Err(format!("could not prepare arguments: {e}")),
+            Ok(_) => match extract(&filter).1 {
+                Some(c) if c.arguments.is_object() => Ok(c.arguments),
+                _ => Err("could not prepare arguments: the model produced no complete call".into()),
+            },
         }
     }
 
@@ -336,6 +394,151 @@ impl State {
         }
         self.save_adapter();
     }
+}
+
+/// `/v1/ask`: pick every relevant headless tool, let the model fill their arguments, run
+/// them in parallel, learn from the outcomes and render the results as a categorized page.
+fn ask(body: &Value, state: &Arc<Mutex<State>>) -> Result<Value, String> {
+    let question = body.get("question").and_then(Value::as_str).map(str::trim).unwrap_or("").to_string();
+    if question.is_empty() {
+        return Err("\"question\" must be a non-empty string".into());
+    }
+    let max_tools = body.get("max_tools").and_then(Value::as_u64).unwrap_or(6).clamp(1, 32) as usize;
+    let mut st = lock(state);
+    if st.headless.is_empty() {
+        return Err("no headless tools are configured (start with --headless-tools FILE)".into());
+    }
+    let names: Vec<String> = st.headless.iter().map(|t| t.name.clone()).collect();
+    let selected: Vec<String> = if let Some(list) = body.get("tools").and_then(Value::as_array) {
+        let want: Vec<String> = list.iter().filter_map(Value::as_str).map(str::to_string).collect();
+        if let Some(bad) = want.iter().find(|w| !names.contains(w)) {
+            return Err(format!("unknown tool {bad}"));
+        }
+        want
+    } else if body.get("all").and_then(Value::as_bool).unwrap_or(false) {
+        names.clone()
+    } else {
+        select_tools(&question, &st.headless, &st.toolbook, max_tools)
+    };
+    let mut plans = Vec::new();
+    for n in &selected {
+        let tool = st.headless.iter().find(|t| &t.name == n).cloned().expect("selected tool exists");
+        let args = st.tool_args(&question, &tool);
+        plans.push((tool, args));
+    }
+    drop(st);
+    // run all tools in parallel without holding the engine
+    let outcomes: Vec<headless::Outcome> = std::thread::scope(|s| {
+        let hs: Vec<_> = plans
+            .iter()
+            .map(|(t, a)| {
+                s.spawn(move || match a {
+                    Ok(a) => t.run(a),
+                    Err(e) => headless::Outcome {
+                        status: headless::Status::Error,
+                        value: Value::Null,
+                        error: Some(e.clone()),
+                        truncated: false,
+                        ms: 0,
+                    },
+                })
+            })
+            .collect();
+        hs.into_iter()
+            .map(|h| {
+                h.join().unwrap_or_else(|_| headless::Outcome {
+                    status: headless::Status::Error,
+                    value: Value::Null,
+                    error: Some("tool runner panicked".into()),
+                    truncated: false,
+                    ms: 0,
+                })
+            })
+            .collect()
+    });
+    let mut st = lock(state);
+    let mut cards = Vec::new();
+    for ((tool, args), out) in plans.iter().zip(&outcomes) {
+        let args = args.as_ref().cloned().unwrap_or(Value::Null);
+        let ok = out.status == headless::Status::Ok;
+        let text = match (&out.error, &out.value) {
+            (Some(e), _) => e.clone(),
+            (None, Value::String(s)) => s.clone(),
+            (None, v) => v.to_string(),
+        };
+        st.toolbook.observe(&tool.name, &args.to_string(), &text, ok);
+        if let Some(mem) = &mut st.memory {
+            mem.record(
+                Kind::Result,
+                &tool.name,
+                Some(ok),
+                if ok { 0.3 } else { 0.7 },
+                &format!("{}({}) → {}", tool.name, clip(&args.to_string(), 300), clip(&text, 600)),
+            );
+        }
+        let cat = ui::categorize(&tool.name, &tool.description, tool.category.as_deref());
+        cards.push((cat, ui::Card::new(&tool.name, out.status, out.ms, args.clone(), &out.value, out.error.as_deref(), out.truncated)));
+    }
+    let id = st.next_id("ui_");
+    let page = ui::build(&id, &question, now(), cards);
+    if let Some(mem) = &mut st.memory {
+        mem.record(Kind::User, "", None, 0.3, &question);
+        let cats: Vec<&str> = page.sections.iter().map(|s| ui::CATEGORIES[s.category].title).collect();
+        mem.record(
+            Kind::Action,
+            "",
+            None,
+            0.3,
+            &format!("answered \"{}\" with page {id}: {} tools in {}", clip(&question, 200), plans.len(), cats.join(", ")),
+        );
+    }
+    st.toolbook.save();
+    let out = json!({"id": id, "ui_url": format!("/ui/{id}"), "ui": page.to_json(), "markdown": page.to_markdown()});
+    st.pages.push_back((id, page));
+    while st.pages.len() > MAX_PAGES {
+        st.pages.pop_front();
+    }
+    Ok(out)
+}
+
+/// Words that say nothing about which tool to use.
+const SELECT_STOP: &[&str] = &[
+    "the", "a", "an", "to", "of", "and", "or", "is", "are", "in", "on", "for", "it", "this", "that", "with", "at", "by", "i", "you", "me",
+    "my", "we", "do", "can", "please", "what", "whats", "how", "show", "get", "tell", "give", "today", "now", "current", "latest",
+    "recent", "s", "check", "status",
+];
+
+fn select_words(text: &str) -> HashSet<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() > 1 && !SELECT_STOP.contains(w))
+        .map(|w| match w.strip_suffix('s') {
+            Some(b) if b.len() >= 3 && !b.ends_with('s') => b.to_string(),
+            _ => w.to_string(),
+        })
+        .collect()
+}
+
+/// Tools relevant to a question: every tool sharing a meaningful word with it (name
+/// words count double), best first; without any shared word, close lexical neighbours.
+fn select_tools(question: &str, tools: &[headless::HeadlessTool], book: &ToolBook, max: usize) -> Vec<String> {
+    let q = select_words(question);
+    let mut hits: Vec<(usize, usize)> = tools
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let name = select_words(&t.name);
+            let desc = select_words(&format!("{} {}", t.description, t.category.as_deref().unwrap_or("")));
+            (q.iter().map(|w| 2 * name.contains(w) as usize + desc.contains(w) as usize).sum(), i)
+        })
+        .filter(|(s, _)| *s > 0)
+        .collect();
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    if !hits.is_empty() {
+        return hits.into_iter().take(max).map(|(_, i)| tools[i].name.clone()).collect();
+    }
+    let names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+    book.scored(question, &names).into_iter().filter(|(_, s)| *s >= 0.35).take(max).map(|(n, _)| n).collect()
 }
 
 /// Heuristic: does a tool result report a failure?
@@ -566,6 +769,35 @@ fn route(req: &http::Request, w: &mut TcpStream, state: &Arc<Mutex<State>>) -> s
             let importance = body.get("importance").and_then(Value::as_f64).unwrap_or(0.8) as f32;
             let id = mem.record(kind, tool, body.get("ok").and_then(Value::as_bool), importance, text);
             http::write_json(w, 200, &json!({"ok": true, "id": id, "stored": id.is_some(), "count": mem.len()}).to_string())?
+        }
+        ("POST", "/v1/ask") => match ask(&body, state) {
+            Ok(v) => http::write_json(w, 200, &v.to_string())?,
+            Err(e) => http::write_json(w, 400, &err_json(&e, "invalid_request_error"))?,
+        },
+        ("GET", "/ui") => {
+            let st = lock(state);
+            let mut h = String::from("<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Answers</title><body style=\"font:15px system-ui;margin:16px\"><h1>Answers</h1><ul>");
+            for (id, p) in st.pages.iter().rev() {
+                h.push_str(&format!("<li><a href=\"/ui/{id}\">{}</a> · {}</li>", ui::esc(&p.question), ui::fmt_time(p.created)));
+            }
+            h.push_str("</ul></body>");
+            http::write_text(w, 200, "text/html; charset=utf-8", &h)?
+        }
+        ("GET", p) if p.starts_with("/ui/") => {
+            let st = lock(state);
+            let rest = &p["/ui/".len()..];
+            let (id, kind) = match rest.rsplit_once('.') {
+                Some((i, k)) if k == "json" || k == "md" => (i, k),
+                _ => (rest, "html"),
+            };
+            match st.pages.iter().find(|(i, _)| i == id) {
+                Some((_, page)) => match kind {
+                    "json" => http::write_json(w, 200, &page.to_json().to_string())?,
+                    "md" => http::write_text(w, 200, "text/markdown; charset=utf-8", &page.to_markdown())?,
+                    _ => http::write_text(w, 200, "text/html; charset=utf-8", &page.to_html())?,
+                },
+                None => http::write_json(w, 404, &err_json("unknown page (only recent pages are kept)", "not_found"))?,
+            }
         }
         ("GET", "/v1/tools") => {
             let st = lock(state);
@@ -1097,6 +1329,7 @@ pub fn parse_args(args: &[String]) -> Result<ServerConfig, String> {
             "--memory-size" => c.memory_size = val(&mut i)?.parse().map_err(|_| "bad --memory-size")?,
             "--recall" => c.recall = val(&mut i)?.parse().map_err(|_| "bad --recall")?,
             "--no-memory-tool" => c.memory_tool = false,
+            "--headless-tools" => c.headless = Some(PathBuf::from(val(&mut i)?)),
             "--tool-recall" => c.tool_recall = val(&mut i)?.parse().map_err(|_| "bad --tool-recall")?,
             "--mlock" => c.mlock = true,
             "--gpu" => c.gpu = true,
@@ -1198,6 +1431,12 @@ memory and tool knowledge (on the device):
       --recall N          observations recalled into each request (default 3, 0 = tool only)
       --no-memory-tool    do not offer the built-in recall_memory tool
       --tool-recall K     show the model only the K tools most relevant to the request
+
+ask the phone (headless tools + on-the-fly UI):
+      --headless-tools FILE  manifest of tools the server runs itself (commands or local HTTP);
+                          POST /v1/ask {question: ...} picks every relevant tool, fills
+                          arguments with the model, runs them in parallel and returns a
+                          categorized page: /ui/ID (HTML), /ui/ID.json, /ui/ID.md
 
 online learning (reinforcement learning from feedback):
       --rl                enable correction experts (in memory)

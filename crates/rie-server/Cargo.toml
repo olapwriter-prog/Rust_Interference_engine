@@ -17,4 +17,4 @@ gpu = ["dep:rie-gpu"]
 [dependencies]
 rie-core = { workspace = true }
 rie-gpu = { workspace = true, optional = true }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }

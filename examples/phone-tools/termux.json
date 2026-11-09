@@ -1,0 +1,98 @@
+{
+  "tools": [
+    {
+      "name": "device.battery",
+      "description": "Phone battery level and status",
+      "category": "device",
+      "command": [
+        "termux-battery-status"
+      ]
+    },
+    {
+      "name": "device.wifi",
+      "description": "Current Wi-Fi connection",
+      "category": "device",
+      "command": [
+        "termux-wifi-connectioninfo"
+      ]
+    },
+    {
+      "name": "device.info",
+      "description": "Phone network operator and device info",
+      "category": "device",
+      "command": [
+        "termux-telephony-deviceinfo"
+      ]
+    },
+    {
+      "name": "location.current",
+      "description": "Current location of the phone (GPS/network)",
+      "category": "travel",
+      "command": [
+        "termux-location",
+        "-p",
+        "network",
+        "-r",
+        "once"
+      ],
+      "timeout_ms": 20000
+    },
+    {
+      "name": "messages.recent",
+      "description": "Recent SMS messages",
+      "category": "communication",
+      "command": [
+        "termux-sms-list",
+        "-l",
+        "10"
+      ]
+    },
+    {
+      "name": "calls.recent",
+      "description": "Recent phone calls",
+      "category": "communication",
+      "command": [
+        "termux-call-log",
+        "-l",
+        "10"
+      ]
+    },
+    {
+      "name": "contacts.list",
+      "description": "Contacts on the phone",
+      "category": "communication",
+      "command": [
+        "termux-contact-list"
+      ]
+    },
+    {
+      "name": "notifications.list",
+      "description": "Current notifications",
+      "category": "device",
+      "command": [
+        "termux-notification-list"
+      ]
+    },
+    {
+      "name": "clipboard.get",
+      "description": "Text on the clipboard",
+      "category": "device",
+      "command": [
+        "termux-clipboard-get"
+      ]
+    },
+    {
+      "name": "sensors.steps",
+      "description": "Step counter sensor",
+      "category": "health",
+      "command": [
+        "termux-sensor",
+        "-s",
+        "step_counter",
+        "-n",
+        "1"
+      ],
+      "timeout_ms": 5000
+    }
+  ]
+}

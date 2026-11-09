@@ -244,8 +244,8 @@ impl ToolBook {
         }
     }
 
-    /// Rank `names` by relevance to `query`; returns the best `k` (stable for ties).
-    pub fn relevant(&self, query: &str, names: &[String], k: usize) -> Vec<String> {
+    /// Relevance of each of `names` to `query`, best first (stable for ties).
+    pub fn scored(&self, query: &str, names: &[String]) -> Vec<(String, f32)> {
         let q = embed(query);
         let mut scored: Vec<(f32, usize, &String)> = names
             .iter()
@@ -264,7 +264,12 @@ impl ToolBook {
             })
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
-        scored.into_iter().take(k).map(|x| x.2.clone()).collect()
+        scored.into_iter().map(|x| (x.2.clone(), x.0)).collect()
+    }
+
+    /// Rank `names` by relevance to `query`; returns the best `k` (stable for ties).
+    pub fn relevant(&self, query: &str, names: &[String], k: usize) -> Vec<String> {
+        self.scored(query, names).into_iter().take(k).map(|x| x.0).collect()
     }
 
     /// Learned notes about the given tools (empty if nothing was learned).
