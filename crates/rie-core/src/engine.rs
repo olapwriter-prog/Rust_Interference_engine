@@ -3,10 +3,11 @@
 
 use crate::chat::{ChatTemplate, Message};
 use crate::cpu::CpuTopology;
-use crate::error::{bail, Result};
+use crate::error::{bail, Error, Result};
 use crate::gguf::GgufFile;
 use crate::model::cpu::{CpuBackend, KvType};
 use crate::model::{Backend, Model};
+use crate::rl::{AdapterConfig, CorrectionExperts, Step};
 use crate::sampler::{Sampler, SamplerParams};
 use crate::threadpool::{PoolConfig, ThreadPool};
 use crate::tokenizer::{Tokenizer, Utf8Stream};
@@ -86,6 +87,8 @@ pub enum StopReason {
     StopString,
     ContextFull,
     Cancelled,
+    /// The [`TokenFilter`] ended generation (e.g. a complete tool call was produced).
+    Filter,
 }
 
 #[derive(Debug, Clone)]
@@ -125,10 +128,38 @@ pub struct BenchResult {
     pub gen_tps: f64,
 }
 
+/// Per-token control over generation (grammar-constrained decoding, tool-call detection).
+pub trait TokenFilter {
+    /// Is the next token constrained?
+    fn active(&self) -> bool;
+    /// May token `id` (whose output bytes are `bytes`) come next? Only called when active.
+    fn allows(&self, id: u32, bytes: &[u8]) -> bool;
+    /// Observe the chosen token. Return `true` to stop generating now.
+    fn accept(&mut self, id: u32, bytes: &[u8]) -> bool;
+}
+
+/// No constraint.
+pub struct Unconstrained;
+impl TokenFilter for Unconstrained {
+    fn active(&self) -> bool {
+        false
+    }
+    fn allows(&self, _: u32, _: &[u8]) -> bool {
+        true
+    }
+    fn accept(&mut self, _: u32, _: &[u8]) -> bool {
+        false
+    }
+}
+
 pub struct Engine {
     pub model: Arc<Model>,
     pub tokenizer: Arc<Tokenizer>,
     backend: Box<dyn Backend>,
+    /// Online-learning correction experts (see [`crate::rl`]).
+    pub adapter: Option<CorrectionExperts>,
+    /// Steps of the most recent generation (recorded when an adapter is enabled).
+    trajectory: Vec<Step>,
     /// Tokens whose K/V are currently in the cache, in order.
     cached: Vec<u32>,
     logits: Vec<f32>,
@@ -177,7 +208,16 @@ impl Engine {
     pub fn with_backend(model: Arc<Model>, tokenizer: Arc<Tokenizer>, backend: Box<dyn Backend>) -> Self {
         let template = ChatTemplate::detect(&tokenizer);
         let n_vocab = model.cfg.n_vocab;
-        Engine { model, tokenizer, backend, cached: Vec::new(), logits: vec![0.0; n_vocab], template }
+        Engine {
+            model,
+            tokenizer,
+            backend,
+            adapter: None,
+            trajectory: Vec::new(),
+            cached: Vec::new(),
+            logits: vec![0.0; n_vocab],
+            template,
+        }
     }
 
     pub fn backend_name(&self) -> String {
@@ -231,6 +271,90 @@ impl Engine {
         &self.logits
     }
 
+    // ---- online learning ----
+
+    /// Enable the correction-expert adapter (no effect on outputs until feedback arrives).
+    /// Requires a backend that exposes hidden states (the CPU backend).
+    pub fn enable_adapter(&mut self, cfg: AdapterConfig) -> Result<()> {
+        self.check_hidden()?;
+        self.adapter = Some(CorrectionExperts::new(self.model.cfg.n_embd, self.model.cfg.n_vocab, cfg));
+        Ok(())
+    }
+
+    /// Load a saved adapter (or create a fresh one if the file does not exist).
+    pub fn load_adapter(&mut self, path: &std::path::Path, cfg: AdapterConfig) -> Result<()> {
+        self.check_hidden()?;
+        let a = if path.exists() {
+            CorrectionExperts::load(path, cfg)?
+        } else {
+            CorrectionExperts::new(self.model.cfg.n_embd, self.model.cfg.n_vocab, cfg)
+        };
+        if a.n_embd() != self.model.cfg.n_embd {
+            bail!(Runtime, "adapter was trained for a different model (n_embd {} vs {})", a.n_embd(), self.model.cfg.n_embd);
+        }
+        self.adapter = Some(a);
+        Ok(())
+    }
+
+    fn check_hidden(&mut self) -> Result<()> {
+        if self.backend.hidden().is_none() {
+            // run one token to populate hidden states and verify support
+            let bos = self.tokenizer.bos.unwrap_or(0);
+            self.cached.clear();
+            self.eval_tokens(&[bos])?;
+            self.cached.clear();
+            if self.backend.hidden().is_none() {
+                bail!(
+                    Unsupported,
+                    "the {} backend does not expose hidden states; online learning needs the CPU backend",
+                    self.backend.name()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Steps recorded during the last generation (empty without an adapter).
+    pub fn take_trajectory(&mut self) -> Vec<Step> {
+        std::mem::take(&mut self.trajectory)
+    }
+
+    /// Teacher-force `continuation` after `prompt` and return one learning step per
+    /// continuation token (the policy's view when it should have produced that token).
+    pub fn teacher_force(&mut self, prompt: &[u32], continuation: &[u32]) -> Result<Vec<Step>> {
+        let top_m = self.adapter.as_ref().map(|a| a.cfg.top_m).unwrap_or(32);
+        let e = self.model.cfg.n_embd;
+        let nv = self.model.cfg.n_vocab;
+        if continuation.is_empty() {
+            return Ok(Vec::new());
+        }
+        if prompt.len() + continuation.len() > self.backend.n_ctx() {
+            bail!(Runtime, "correction does not fit in the context window");
+        }
+        self.eval_tokens(prompt)?;
+        let mut steps = Vec::with_capacity(continuation.len());
+        let h = self.backend.hidden().ok_or_else(|| Error::Unsupported("backend has no hidden states".into()))?;
+        steps.push(Step::new(&h[h.len() - e..], &self.logits, continuation[0], top_m));
+        let nb = self.backend.max_batch();
+        let feed = &continuation[..continuation.len() - 1];
+        let mut logits = vec![0.0f32; nb * nv];
+        let mut i = 0;
+        while i < feed.len() {
+            let end = (i + nb).min(feed.len());
+            let pos = self.cached.len();
+            self.backend.forward(&feed[i..end], pos, true, &mut logits)?;
+            self.cached.extend_from_slice(&feed[i..end]);
+            let h = self.backend.hidden().ok_or_else(|| Error::Unsupported("backend has no hidden states".into()))?.to_vec();
+            for r in 0..end - i {
+                steps.push(Step::new(&h[r * e..(r + 1) * e], &logits[r * nv..(r + 1) * nv], continuation[i + r + 1], top_m));
+            }
+            i = end;
+        }
+        // the logits buffer no longer matches the last token: force re-evaluation next time
+        self.cached.pop();
+        Ok(steps)
+    }
+
     /// Free space in a full context: keep the first `n_keep` tokens (at least the BOS),
     /// drop the oldest half of the rest and re-evaluate the remainder so the KV cache is
     /// consistent with the new positions. Returns `false` if nothing can be dropped.
@@ -282,8 +406,20 @@ impl Engine {
         &mut self,
         tokens: &[u32],
         params: &GenerateParams,
+        on_text: impl FnMut(&str) -> bool,
+    ) -> Result<GenerationStats> {
+        self.generate_hooked(tokens, params, &mut Unconstrained, on_text)
+    }
+
+    /// Generation with a [`TokenFilter`] (constrained decoding / tool calls).
+    pub fn generate_hooked(
+        &mut self,
+        tokens: &[u32],
+        params: &GenerateParams,
+        filter: &mut dyn TokenFilter,
         mut on_text: impl FnMut(&str) -> bool,
     ) -> Result<GenerationStats> {
+        self.trajectory.clear();
         let t0 = Instant::now();
         let reused = self.eval_tokens(tokens)?;
         let prompt_time = t0.elapsed();
@@ -298,9 +434,32 @@ impl Engine {
         let mut logits = self.logits.clone();
         'gen: while n_gen < params.max_tokens {
             logits.copy_from_slice(&self.logits);
+            let hidden: Option<Vec<f32>> = match (&self.adapter, self.backend.hidden()) {
+                (Some(_), Some(h)) => Some(h[h.len() - self.model.cfg.n_embd..].to_vec()),
+                _ => None,
+            };
+            if let (Some(a), Some(h)) = (&self.adapter, &hidden) {
+                a.apply(h, &mut logits);
+            }
             let history_start = self.cached.len().saturating_sub(params.sampler.repeat_last_n);
-            let tok = sampler.sample(&mut logits, &self.cached[history_start..]);
+            let tok = if filter.active() {
+                let tk = self.tokenizer.clone();
+                let f = &*filter;
+                match sampler.sample_masked(&mut logits, &self.cached[history_start..], &mut |id| f.allows(id, tk.token_bytes(id))) {
+                    Some(t) => t,
+                    None => {
+                        stop = StopReason::EndOfSequence;
+                        break;
+                    }
+                }
+            } else {
+                sampler.sample(&mut logits, &self.cached[history_start..])
+            };
+            if let (Some(a), Some(h)) = (&self.adapter, &hidden) {
+                self.trajectory.push(Step::new(h, &self.logits, tok, a.cfg.top_m));
+            }
             n_gen += 1;
+            let filter_stop = filter.accept(tok, self.tokenizer.token_bytes(tok));
             if !params.ignore_eos && self.tokenizer.is_stop(tok) {
                 // The stop token is not evaluated; the next chat turn re-renders it as part
                 // of the template and the prefix match resumes from there.
@@ -341,6 +500,14 @@ impl Engine {
                     stop = StopReason::Cancelled;
                     break;
                 }
+            }
+            if filter_stop {
+                stop = StopReason::Filter;
+                // keep the cache consistent with the emitted text
+                if self.cached.len() < self.backend.n_ctx() {
+                    self.eval_next(tok)?;
+                }
+                break;
             }
             if self.cached.len() >= self.backend.n_ctx() && (!params.context_shift || !self.shift_context(params.n_keep)?) {
                 stop = StopReason::ContextFull;

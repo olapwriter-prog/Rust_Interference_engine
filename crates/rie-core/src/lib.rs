@@ -17,6 +17,7 @@
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
 pub mod chat;
+pub mod constrain;
 pub mod cpu;
 pub mod engine;
 pub mod error;
@@ -25,6 +26,7 @@ pub mod kernels;
 pub mod model;
 pub mod ops;
 pub mod quant;
+pub mod rl;
 pub mod sampler;
 pub mod tensor;
 #[doc(hidden)]

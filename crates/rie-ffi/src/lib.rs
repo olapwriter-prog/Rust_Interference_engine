@@ -209,6 +209,7 @@ pub(crate) fn to_stats(s: &GenerationStats) -> RieStats {
             StopReason::StopString => 2,
             StopReason::ContextFull => 3,
             StopReason::Cancelled => 4,
+            StopReason::Filter => 5,
         },
     }
 }

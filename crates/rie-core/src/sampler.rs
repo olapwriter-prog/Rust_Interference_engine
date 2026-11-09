@@ -60,7 +60,77 @@ impl Sampler {
 
     /// Pick the next token from `logits` (modified in place by penalties).
     pub fn sample(&mut self, logits: &mut [f32], history: &[u32]) -> u32 {
+        self.apply_penalties(logits, history);
         let p = self.params.clone();
+        if p.temperature <= 0.0 {
+            return argmax(logits);
+        }
+        // top-k (partial selection, O(n))
+        self.cand.clear();
+        self.cand.extend(logits.iter().enumerate().map(|(i, &l)| (i as u32, l)));
+        let k = if p.top_k == 0 { self.cand.len() } else { p.top_k.min(self.cand.len()) };
+        if k < self.cand.len() {
+            self.cand.select_nth_unstable_by(k - 1, |a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            self.cand.truncate(k);
+        }
+        self.cand.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        self.pick_from_cand()
+    }
+
+    /// Like [`Sampler::sample`] but only tokens for which `allow(id)` is true can be chosen
+    /// (grammar-constrained decoding). Candidates are tested in descending logit order, so
+    /// typically only a handful of `allow` calls are made. Returns `None` if no token in the
+    /// vocabulary is allowed.
+    pub fn sample_masked(&mut self, logits: &mut [f32], history: &[u32], allow: &mut dyn FnMut(u32) -> bool) -> Option<u32> {
+        self.apply_penalties(logits, history);
+        let p = self.params.clone();
+        let want = if p.temperature <= 0.0 {
+            1
+        } else if p.top_k == 0 {
+            64
+        } else {
+            p.top_k.min(64)
+        };
+        let mut order: Vec<(u32, f32)> = logits.iter().enumerate().map(|(i, &l)| (i as u32, l)).collect();
+        let cmp = |a: &(u32, f32), b: &(u32, f32)| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal);
+        self.cand.clear();
+        // look at the best 4096 first; fall back to the whole vocabulary in order
+        let head = 4096.min(order.len());
+        if head < order.len() {
+            order.select_nth_unstable_by(head - 1, cmp);
+        }
+        order[..head].sort_unstable_by(cmp);
+        for &(id, l) in &order[..head] {
+            if l.is_finite() && allow(id) {
+                self.cand.push((id, l));
+                if self.cand.len() >= want {
+                    break;
+                }
+            }
+        }
+        if self.cand.is_empty() && head < order.len() {
+            let rest = &mut order[head..];
+            rest.sort_unstable_by(cmp);
+            for &(id, l) in rest.iter() {
+                if allow(id) {
+                    self.cand.push((id, l));
+                    if self.cand.len() >= want {
+                        break;
+                    }
+                }
+            }
+        }
+        if self.cand.is_empty() {
+            return None;
+        }
+        if p.temperature <= 0.0 {
+            return Some(self.cand[0].0);
+        }
+        Some(self.pick_from_cand())
+    }
+
+    fn apply_penalties(&mut self, logits: &mut [f32], history: &[u32]) {
+        let p = &self.params;
         // penalties
         if (p.repeat_penalty != 1.0 || p.frequency_penalty != 0.0 || p.presence_penalty != 0.0) && !history.is_empty() {
             let start = history.len().saturating_sub(p.repeat_last_n);
@@ -80,18 +150,11 @@ impl Sampler {
                 *l -= c as f32 * p.frequency_penalty + p.presence_penalty;
             }
         }
-        if p.temperature <= 0.0 {
-            return argmax(logits);
-        }
-        // top-k (partial selection, O(n))
-        self.cand.clear();
-        self.cand.extend(logits.iter().enumerate().map(|(i, &l)| (i as u32, l)));
-        let k = if p.top_k == 0 { self.cand.len() } else { p.top_k.min(self.cand.len()) };
-        if k < self.cand.len() {
-            self.cand.select_nth_unstable_by(k - 1, |a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            self.cand.truncate(k);
-        }
-        self.cand.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    /// Temperature softmax, min-p, top-p and a random draw over `self.cand` (sorted, best first).
+    fn pick_from_cand(&mut self) -> u32 {
+        let p = self.params.clone();
         // temperature softmax
         let max = self.cand[0].1;
         let mut sum = 0.0;

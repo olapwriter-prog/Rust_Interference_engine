@@ -1,0 +1,665 @@
+//! Grammar-constrained decoding.
+//!
+//! Small models (0.5B–4B) often pick the right tool but then produce broken JSON, unknown
+//! tool names or misspelled argument names. Instead of repairing the output afterwards,
+//! [`JsonConstraint`] is consulted for every candidate token during sampling and only
+//! tokens that keep the output a valid prefix of
+//!
+//! ```text
+//! {"name": <one of the tool names>, "arguments": {<declared argument>: <value of the declared type>, ...}}
+//! ```
+//!
+//! are allowed (or, in [`JsonConstraint::any_object`] mode, of any JSON object). The check
+//! is a byte-level pushdown automaton; testing a candidate costs one small clone plus the
+//! token's bytes.
+
+use std::sync::Arc;
+
+/// JSON type expected for an argument value (from the tool's JSON schema).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgType {
+    String,
+    Number,
+    Integer,
+    Boolean,
+    Array,
+    Object,
+    Any,
+}
+
+impl ArgType {
+    pub fn from_schema(t: &str) -> Self {
+        match t {
+            "string" => ArgType::String,
+            "number" => ArgType::Number,
+            "integer" => ArgType::Integer,
+            "boolean" => ArgType::Boolean,
+            "array" => ArgType::Array,
+            "object" => ArgType::Object,
+            _ => ArgType::Any,
+        }
+    }
+}
+
+/// What the constraint needs to know about one tool.
+#[derive(Debug, Clone)]
+pub struct ToolSig {
+    pub name: String,
+    /// Declared arguments. Empty means "any keys".
+    pub args: Vec<(String, ArgType)>,
+    pub required: Vec<String>,
+    /// Allowed string values for enum-typed arguments.
+    pub enums: Vec<(String, Vec<String>)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjSt {
+    /// after `{`: key or `}`
+    KeyOrEnd,
+    /// after `,`: key
+    Key,
+    Colon,
+    Value,
+    CommaOrEnd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArrSt {
+    ValueOrEnd,
+    Value,
+    CommaOrEnd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Schema {
+    Any,
+    /// `{"name": …, "arguments": {…}}`
+    ToolRoot,
+    /// arguments object of tool `i`
+    Args(usize),
+}
+
+#[derive(Debug, Clone)]
+enum Frame {
+    Obj { st: ObjSt, schema: Schema, seen: Vec<u16>, key: Vec<u8> },
+    Arr { st: ArrSt },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NumPhase {
+    Sign,
+    Int0,
+    Int,
+    Dot,
+    Frac,
+    Exp,
+    ExpSign,
+    ExpDigits,
+}
+
+#[derive(Debug, Clone)]
+enum Lex {
+    None,
+    Str {
+        is_key: bool,
+        esc: bool,
+        uni: u8,
+        len: usize,
+        /// accumulated bytes when the value must match one of `allowed`
+        buf: Vec<u8>,
+        allowed: Option<Arc<Vec<Vec<u8>>>>,
+    },
+    Num {
+        phase: NumPhase,
+        len: usize,
+        integer: bool,
+    },
+    Lit {
+        word: &'static [u8],
+        pos: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Root {
+    Start,
+    Inside,
+    Done,
+}
+
+const MAX_WS_RUN: u8 = 3;
+const MAX_STRING: usize = 8192;
+const MAX_NUMBER: usize = 32;
+const MAX_DEPTH: usize = 24;
+
+/// Incremental JSON validator with tool-call schema awareness. See the module docs.
+#[derive(Debug, Clone)]
+pub struct JsonConstraint {
+    tools: Arc<Vec<ToolSig>>,
+    tool_names: Arc<Vec<Vec<u8>>>,
+    /// Key under which arguments appear: "arguments" (Hermes/Qwen) or "parameters" (Llama 3).
+    args_key: Arc<Vec<Vec<u8>>>,
+    frames: Vec<Frame>,
+    lex: Lex,
+    root: Root,
+    ws_run: u8,
+    root_schema: Schema,
+    /// chosen tool (index) once its name string is complete
+    chosen: Option<usize>,
+    /// key whose value is being parsed (set at the colon)
+    pending_key: Option<u16>,
+    max_string: usize,
+}
+
+impl JsonConstraint {
+    /// Constrain to a call of one of `tools`. `args_key` is "arguments" or "parameters".
+    pub fn tool_call(tools: Arc<Vec<ToolSig>>, args_key: &str) -> Self {
+        let names = tools.iter().map(|t| t.name.as_bytes().to_vec()).collect();
+        JsonConstraint {
+            tool_names: Arc::new(names),
+            tools,
+            args_key: Arc::new(vec![args_key.as_bytes().to_vec()]),
+            frames: Vec::new(),
+            lex: Lex::None,
+            root: Root::Start,
+            ws_run: 0,
+            root_schema: Schema::ToolRoot,
+            chosen: None,
+            pending_key: None,
+            max_string: MAX_STRING,
+        }
+    }
+
+    /// Constrain to any JSON object (`response_format: json_object`).
+    pub fn any_object() -> Self {
+        JsonConstraint {
+            tools: Arc::new(Vec::new()),
+            tool_names: Arc::new(Vec::new()),
+            args_key: Arc::new(Vec::new()),
+            frames: Vec::new(),
+            lex: Lex::None,
+            root: Root::Start,
+            ws_run: 0,
+            root_schema: Schema::Any,
+            chosen: None,
+            pending_key: None,
+            max_string: MAX_STRING,
+        }
+    }
+
+    /// Limit string values to `n` bytes (after that the string must close). Guards against
+    /// small models rambling inside an argument.
+    pub fn with_max_string(mut self, n: usize) -> Self {
+        self.max_string = n.max(1);
+        self
+    }
+
+    /// The root object has been closed.
+    pub fn is_complete(&self) -> bool {
+        self.root == Root::Done
+    }
+
+    /// Name of the tool being called, once known.
+    pub fn tool_name(&self) -> Option<&str> {
+        self.chosen.map(|i| self.tools[i].name.as_str())
+    }
+
+    /// Would appending `bytes` keep the output valid?
+    pub fn accepts(&self, bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return false; // control tokens / empty pieces make no progress
+        }
+        let mut c = self.clone();
+        c.feed(bytes)
+    }
+
+    /// Append `bytes`. Returns false (leaving the state unspecified) if they are invalid.
+    pub fn feed(&mut self, bytes: &[u8]) -> bool {
+        bytes.iter().all(|&b| self.step(b))
+    }
+
+    fn keys_for(&self, schema: Schema, seen: &[u16]) -> Vec<Vec<u8>> {
+        match schema {
+            Schema::Any => Vec::new(),
+            Schema::ToolRoot => {
+                if seen.is_empty() {
+                    vec![b"name".to_vec()]
+                } else if seen.len() == 1 {
+                    (*self.args_key).clone()
+                } else {
+                    Vec::new()
+                }
+            }
+            Schema::Args(i) => self.tools[i]
+                .args
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| !seen.contains(&(*k as u16)))
+                .map(|(_, (n, _))| n.as_bytes().to_vec())
+                .collect(),
+        }
+    }
+
+    /// May the object with this schema be closed now?
+    fn can_close(&self, schema: Schema, seen: &[u16]) -> bool {
+        match schema {
+            Schema::Any => true,
+            Schema::ToolRoot => seen.len() == 2,
+            Schema::Args(i) => {
+                let t = &self.tools[i];
+                t.required.iter().all(|r| t.args.iter().position(|(n, _)| n == r).is_none_or(|k| seen.contains(&(k as u16))))
+            }
+        }
+    }
+
+    fn key_index(&self, schema: Schema, key: &[u8], seen_len: usize) -> u16 {
+        match schema {
+            Schema::Args(i) => self.tools[i].args.iter().position(|(n, _)| n.as_bytes() == key).map(|k| k as u16).unwrap_or(u16::MAX),
+            Schema::ToolRoot => seen_len as u16,
+            Schema::Any => u16::MAX,
+        }
+    }
+
+    /// Constraints for the value that is about to start inside the innermost frame.
+    fn value_rule(&self) -> (ArgType, Option<Arc<Vec<Vec<u8>>>>, Schema) {
+        if let Some(Frame::Obj { schema, .. }) = self.frames.last() {
+            match (*schema, self.pending_key) {
+                (Schema::ToolRoot, Some(0)) => return (ArgType::String, Some(self.tool_names.clone()), Schema::Any),
+                (Schema::ToolRoot, Some(1)) => {
+                    let s = self.chosen.map(Schema::Args).unwrap_or(Schema::Any);
+                    return (ArgType::Object, None, s);
+                }
+                (Schema::Args(i), Some(k)) if k != u16::MAX => {
+                    let (name, ty) = &self.tools[i].args[k as usize];
+                    let en = self.tools[i]
+                        .enums
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, v)| Arc::new(v.iter().map(|s| s.as_bytes().to_vec()).collect()));
+                    return (*ty, en, Schema::Any);
+                }
+                _ => {}
+            }
+        }
+        (ArgType::Any, None, Schema::Any)
+    }
+
+    fn is_ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\n' | b'\t' | b'\r')
+    }
+
+    fn ws(&mut self) -> bool {
+        self.ws_run += 1;
+        self.ws_run <= MAX_WS_RUN
+    }
+
+    fn step(&mut self, b: u8) -> bool {
+        // ---- inside a lexeme ----
+        match &mut self.lex {
+            Lex::Str { is_key, esc, uni, len, buf, allowed } => {
+                *len += 1;
+                // at the length cap only the closing quote is allowed (never a dead end)
+                // (applies to free-text values only, not to keys or enum values)
+                let capped = !*is_key && allowed.is_none() && *len > self.max_string;
+                if (capped || *len > MAX_STRING) && (b != b'"' || *esc || *uni > 0) {
+                    return false;
+                }
+                if *uni > 0 {
+                    if !b.is_ascii_hexdigit() {
+                        return false;
+                    }
+                    *uni -= 1;
+                    return true;
+                }
+                if *esc {
+                    *esc = false;
+                    if allowed.is_some() {
+                        return false; // enum strings never need escapes
+                    }
+                    return match b {
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => true,
+                        b'u' => {
+                            *uni = 4;
+                            true
+                        }
+                        _ => false,
+                    };
+                }
+                return match b {
+                    b'"' => {
+                        let key = *is_key;
+                        if let Some(al) = allowed {
+                            if !al.iter().any(|a| a == buf) {
+                                return false;
+                            }
+                        }
+                        let text = std::mem::take(buf);
+                        self.lex = Lex::None;
+                        return if key { self.end_key(text) } else { self.end_value_string(text) };
+                    }
+                    // enum strings (tool names, argument keys) never contain escapes: rejecting
+                    // the backslash here avoids accepting a prefix with no valid continuation
+                    b'\\' if allowed.is_some() => false,
+                    b'\\' => {
+                        *esc = true;
+                        true
+                    }
+                    0..=0x1f => false,
+                    _ => {
+                        if let Some(al) = allowed {
+                            buf.push(b);
+                            al.iter().any(|a| a.starts_with(buf))
+                        } else {
+                            if *is_key {
+                                buf.push(b);
+                            }
+                            true
+                        }
+                    }
+                };
+            }
+            Lex::Num { phase, len, integer } => {
+                *len += 1;
+                if *len > MAX_NUMBER {
+                    return false;
+                }
+                let integer = *integer;
+                let next = match (phase.clone(), b) {
+                    (NumPhase::Sign, b'0') => Some(NumPhase::Int0),
+                    (NumPhase::Sign, b'1'..=b'9') => Some(NumPhase::Int),
+                    (NumPhase::Int, b'0'..=b'9') => Some(NumPhase::Int),
+                    (NumPhase::Int0 | NumPhase::Int, b'.') if !integer => Some(NumPhase::Dot),
+                    (NumPhase::Dot | NumPhase::Frac, b'0'..=b'9') => Some(NumPhase::Frac),
+                    (NumPhase::Int0 | NumPhase::Int | NumPhase::Frac, b'e' | b'E') if !integer => Some(NumPhase::Exp),
+                    (NumPhase::Exp, b'+' | b'-') => Some(NumPhase::ExpSign),
+                    (NumPhase::Exp | NumPhase::ExpSign | NumPhase::ExpDigits, b'0'..=b'9') => Some(NumPhase::ExpDigits),
+                    _ => None,
+                };
+                if let Some(n) = next {
+                    *phase = n;
+                    return true;
+                }
+                // number ends here if it is complete; then re-process b
+                if !matches!(phase, NumPhase::Int0 | NumPhase::Int | NumPhase::Frac | NumPhase::ExpDigits) {
+                    return false;
+                }
+                self.lex = Lex::None;
+                if !self.end_value() {
+                    return false;
+                }
+                return self.step(b);
+            }
+            Lex::Lit { word, pos } => {
+                if word[*pos] != b {
+                    return false;
+                }
+                *pos += 1;
+                if *pos == word.len() {
+                    self.lex = Lex::None;
+                    return self.end_value();
+                }
+                return true;
+            }
+            Lex::None => {}
+        }
+
+        // ---- structural ----
+        if Self::is_ws(b) {
+            return self.ws();
+        }
+        self.ws_run = 0;
+        match self.root {
+            Root::Done => false,
+            Root::Start => {
+                if b != b'{' {
+                    return false;
+                }
+                self.root = Root::Inside;
+                let schema = self.root_schema;
+                self.frames.push(Frame::Obj { st: ObjSt::KeyOrEnd, schema, seen: Vec::new(), key: Vec::new() });
+                true
+            }
+            Root::Inside => self.step_structural(b),
+        }
+    }
+
+    fn step_structural(&mut self, b: u8) -> bool {
+        let Some(top) = self.frames.last().cloned() else { return false };
+        match top {
+            Frame::Obj { st, schema, seen, .. } => match (st, b) {
+                (ObjSt::KeyOrEnd | ObjSt::Key, b'"') => {
+                    let allowed = self.keys_for(schema, &seen);
+                    let allowed = if schema == Schema::Any { None } else { Some(Arc::new(allowed)) };
+                    if let Some(a) = &allowed {
+                        if a.is_empty() {
+                            return false;
+                        }
+                    }
+                    self.lex = Lex::Str { is_key: true, esc: false, uni: 0, len: 0, buf: Vec::new(), allowed };
+                    true
+                }
+                (ObjSt::KeyOrEnd | ObjSt::CommaOrEnd, b'}') => {
+                    if !self.can_close(schema, &seen) {
+                        return false;
+                    }
+                    self.frames.pop();
+                    self.end_value()
+                }
+                (ObjSt::Colon, b':') => {
+                    self.set_obj_state(ObjSt::Value);
+                    true
+                }
+                (ObjSt::CommaOrEnd, b',') => {
+                    // only if more keys remain for constrained objects
+                    if schema != Schema::Any && self.keys_for(schema, &seen).is_empty() {
+                        return false;
+                    }
+                    self.set_obj_state(ObjSt::Key);
+                    true
+                }
+                (ObjSt::Value, _) => self.start_value(b),
+                _ => false,
+            },
+            Frame::Arr { st } => match (st, b) {
+                (ArrSt::ValueOrEnd | ArrSt::CommaOrEnd, b']') => {
+                    if st == ArrSt::ValueOrEnd || st == ArrSt::CommaOrEnd {
+                        self.frames.pop();
+                        return self.end_value();
+                    }
+                    false
+                }
+                (ArrSt::CommaOrEnd, b',') => {
+                    if let Some(Frame::Arr { st }) = self.frames.last_mut() {
+                        *st = ArrSt::Value;
+                    }
+                    true
+                }
+                (ArrSt::ValueOrEnd | ArrSt::Value, _) => {
+                    self.pending_key = None;
+                    self.start_value(b)
+                }
+                _ => false,
+            },
+        }
+    }
+
+    fn set_obj_state(&mut self, s: ObjSt) {
+        if let Some(Frame::Obj { st, .. }) = self.frames.last_mut() {
+            *st = s;
+        }
+    }
+
+    fn start_value(&mut self, b: u8) -> bool {
+        let (ty, allowed, child) = self.value_rule();
+        let ok_type = |t: ArgType| ty == ArgType::Any || ty == t;
+        match b {
+            b'"' if ok_type(ArgType::String) => {
+                self.lex = Lex::Str { is_key: false, esc: false, uni: 0, len: 0, buf: Vec::new(), allowed };
+                true
+            }
+            b'{' if ok_type(ArgType::Object) => {
+                if self.frames.len() >= MAX_DEPTH {
+                    return false;
+                }
+                self.frames.push(Frame::Obj { st: ObjSt::KeyOrEnd, schema: child, seen: Vec::new(), key: Vec::new() });
+                true
+            }
+            b'[' if ok_type(ArgType::Array) => {
+                if self.frames.len() >= MAX_DEPTH {
+                    return false;
+                }
+                self.frames.push(Frame::Arr { st: ArrSt::ValueOrEnd });
+                true
+            }
+            b'-' | b'0'..=b'9' if ok_type(ArgType::Number) || ty == ArgType::Integer => {
+                let phase = match b {
+                    b'-' => NumPhase::Sign,
+                    b'0' => NumPhase::Int0,
+                    _ => NumPhase::Int,
+                };
+                self.lex = Lex::Num { phase, len: 1, integer: ty == ArgType::Integer };
+                true
+            }
+            b't' if ok_type(ArgType::Boolean) => {
+                self.lex = Lex::Lit { word: b"true", pos: 1 };
+                true
+            }
+            b'f' if ok_type(ArgType::Boolean) => {
+                self.lex = Lex::Lit { word: b"false", pos: 1 };
+                true
+            }
+            b'n' if ty == ArgType::Any => {
+                self.lex = Lex::Lit { word: b"null", pos: 1 };
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn end_key(&mut self, text: Vec<u8>) -> bool {
+        let Some(Frame::Obj { schema, seen, .. }) = self.frames.last() else { return false };
+        let (schema, seen_len) = (*schema, seen.len());
+        let idx = self.key_index(schema, &text, seen_len);
+        if let Some(Frame::Obj { st, seen, key, .. }) = self.frames.last_mut() {
+            if idx != u16::MAX {
+                seen.push(idx);
+            } else {
+                seen.push(u16::MAX - 1);
+            }
+            *key = text;
+            *st = ObjSt::Colon;
+        }
+        self.pending_key = Some(idx);
+        true
+    }
+
+    fn end_value_string(&mut self, text: Vec<u8>) -> bool {
+        // completing the tool name selects the argument schema
+        if let Some(Frame::Obj { schema: Schema::ToolRoot, .. }) = self.frames.last() {
+            if self.pending_key == Some(0) {
+                self.chosen = self.tool_names.iter().position(|n| *n == text);
+            }
+        }
+        self.end_value()
+    }
+
+    /// A value finished: advance the parent container.
+    fn end_value(&mut self) -> bool {
+        match self.frames.last_mut() {
+            None => {
+                self.root = Root::Done;
+                true
+            }
+            Some(Frame::Obj { st, .. }) => {
+                *st = ObjSt::CommaOrEnd;
+                true
+            }
+            Some(Frame::Arr { st }) => {
+                *st = ArrSt::CommaOrEnd;
+                true
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tools() -> Arc<Vec<ToolSig>> {
+        Arc::new(vec![
+            ToolSig {
+                name: "fin.loan_emi".into(),
+                args: vec![("principal".into(), ArgType::Number), ("months".into(), ArgType::Integer), ("note".into(), ArgType::String)],
+                required: vec!["principal".into(), "months".into()],
+                enums: vec![],
+            },
+            ToolSig {
+                name: "browser.open".into(),
+                args: vec![("url".into(), ArgType::String), ("mode".into(), ArgType::String)],
+                required: vec!["url".into()],
+                enums: vec![("mode".into(), vec!["tab".into(), "window".into()])],
+            },
+        ])
+    }
+
+    fn ok(s: &str) -> bool {
+        let mut c = JsonConstraint::tool_call(tools(), "arguments");
+        c.feed(s.as_bytes()) && c.is_complete()
+    }
+
+    #[test]
+    fn accepts_valid_calls() {
+        assert!(ok(r#"{"name": "fin.loan_emi", "arguments": {"principal": 1000000, "months": 240}}"#));
+        assert!(ok(r#"{"name":"fin.loan_emi","arguments":{"months":12,"principal":2.5e5,"note":"a \"q\" é"}}"#));
+        assert!(ok(r#"{"name": "browser.open", "arguments": {"url": "https://x.org", "mode": "tab"}}"#));
+    }
+
+    #[test]
+    fn rejects_invalid_calls() {
+        assert!(!ok(r#"{"name": "fin.loan", "arguments": {}}"#), "unknown tool");
+        assert!(!ok(r#"{"name": "fin.loan_emi", "arguments": {"principal": 1}}"#), "missing required");
+        assert!(!ok(r#"{"name": "fin.loan_emi", "arguments": {"principal": "1", "months": 2}}"#), "wrong type");
+        assert!(!ok(r#"{"name": "fin.loan_emi", "arguments": {"principal": 1, "months": 2.5}}"#), "integer");
+        assert!(!ok(r#"{"name": "fin.loan_emi", "arguments": {"principal": 1, "months": 2, "x": 1}}"#), "unknown arg");
+        assert!(!ok(r#"{"name": "browser.open", "arguments": {"url": "u", "mode": "popup"}}"#), "enum");
+        assert!(!ok(r#"{"arguments": {}, "name": "browser.open"}"#), "order");
+        assert!(!ok(r#"{"name": "browser.open", "arguments": {"url": "u"}} x"#), "trailing");
+        assert!(!ok(r#"{"name": "browser.open",      "arguments": {"url": "u"}}"#), "whitespace run");
+    }
+
+    #[test]
+    fn prefix_checks_guide_generation() {
+        let c = JsonConstraint::tool_call(tools(), "arguments");
+        assert!(c.accepts(b"{\"na"));
+        assert!(!c.accepts(b"{\"ar"));
+        let mut c2 = c.clone();
+        assert!(c2.feed(b"{\"name\": \"fin."));
+        assert!(c2.accepts(b"loan"));
+        assert!(!c2.accepts(b"open"));
+        assert!(c2.feed(b"loan_emi\""));
+        assert_eq!(c2.tool_name(), Some("fin.loan_emi"));
+        assert!(c2.feed(b", \"arguments\": {\""));
+        assert!(c2.accepts(b"pri"));
+        assert!(!c2.accepts(b"url"));
+        assert!(!c2.accepts(b"\\"), "escapes in enum keys would be a dead end");
+    }
+
+    #[test]
+    fn string_cap_forces_closing_quote() {
+        let mut c = JsonConstraint::tool_call(tools(), "arguments").with_max_string(4);
+        assert!(c.feed(br#"{"name": "browser.open", "arguments": {"url": "abcd"#));
+        assert!(!c.accepts(b"e"), "over the cap");
+        assert!(c.accepts(b"\""), "closing quote must stay possible");
+    }
+
+    #[test]
+    fn any_object_mode() {
+        let mut c = JsonConstraint::any_object();
+        assert!(c.feed(br#"{"a": [1, -2.5e3, true, null, {"b": "c"}], "d": {}}"#) && c.is_complete());
+        let mut c = JsonConstraint::any_object();
+        assert!(!c.feed(b"[1]"));
+        let mut c = JsonConstraint::any_object();
+        assert!(!c.feed(br#"{"a": 01}"#));
+    }
+}

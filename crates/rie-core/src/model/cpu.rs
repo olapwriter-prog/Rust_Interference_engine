@@ -67,6 +67,8 @@ pub struct CpuBackend {
     sin_swa: Vec<f32>,
     acts: QuantActs,
     moe: MoeScratch,
+    /// rows of `xn` holding the final hidden states of the last forward
+    hidden_rows: usize,
 }
 
 /// Scratch buffers for mixture-of-experts layers.
@@ -140,6 +142,7 @@ impl CpuBackend {
             cos_swa: vec![0.0; max_batch * half],
             sin_swa: vec![0.0; max_batch * half],
             acts: QuantActs::new(),
+            hidden_rows: 0,
             model,
             pool,
             n_ctx,
@@ -331,6 +334,7 @@ impl CpuBackend {
         if logits.len() < m * nv {
             bail!(Runtime, "logits buffer too small");
         }
+        self.hidden_rows = m;
         self.acts.prepare(pool, &self.xn, m, e, &formats_for(&[&model.output]));
         let out_w = if model.output.rows > nv { model.output.slice_rows(0, nv) } else { model.output.clone() };
         matmul(pool, &self.acts, &out_w, &mut logits[..m * nv]);
@@ -355,7 +359,11 @@ impl Backend for CpuBackend {
         self.n_ctx
     }
     fn forward(&mut self, tokens: &[u32], pos: usize, all_logits: bool, logits: &mut [f32]) -> Result<()> {
+        self.hidden_rows = 0;
         self.forward_impl(tokens, pos, all_logits, logits)
+    }
+    fn hidden(&self) -> Option<&[f32]> {
+        (self.hidden_rows > 0).then(|| &self.xn[..self.hidden_rows * self.model.cfg.n_embd])
     }
 }
 

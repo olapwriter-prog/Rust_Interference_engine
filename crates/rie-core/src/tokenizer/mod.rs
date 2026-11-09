@@ -52,6 +52,8 @@ pub struct Tokenizer {
     /// sorted longest first.
     specials: Vec<(String, u32)>,
     pub chat_template: Option<String>,
+    /// Lazily built table of each token's output bytes (control tokens: empty).
+    bytes_cache: std::sync::OnceLock<Vec<Box<[u8]>>>,
 }
 
 impl Tokenizer {
@@ -133,6 +135,7 @@ impl Tokenizer {
             stop_tokens,
             specials,
             chat_template: g.get_str("tokenizer.chat_template").map(str::to_string),
+            bytes_cache: std::sync::OnceLock::new(),
         })
     }
 
@@ -219,6 +222,14 @@ impl Tokenizer {
             Kind::Spm(_) => spm::decode(text, self.types[id as usize]),
             Kind::Bpe(_) => bpe::decode(text),
         }
+    }
+
+    /// Output bytes of a token without allocation (cached; control tokens are empty).
+    pub fn token_bytes(&self, id: u32) -> &[u8] {
+        let t = self
+            .bytes_cache
+            .get_or_init(|| (0..self.tokens.len() as u32).map(|i| self.decode_token(i, false).into_boxed_slice()).collect());
+        t.get(id as usize).map(|b| &b[..]).unwrap_or(&[])
     }
 
     pub fn decode(&self, ids: &[u32], show_special: bool) -> String {

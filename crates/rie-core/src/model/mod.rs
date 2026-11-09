@@ -289,4 +289,10 @@ pub trait Backend: Send {
     /// positions `< pos`). Writes the logits of the last token into `logits`
     /// (length `n_vocab`), or of every token (`n * n_vocab`) when `all_logits`.
     fn forward(&mut self, tokens: &[u32], pos: usize, all_logits: bool, logits: &mut [f32]) -> Result<()>;
+    /// Final normalized hidden states (the output-head input) of the rows whose logits the
+    /// last `forward` produced, `rows × n_embd`. Used by the online-learning adapters.
+    /// Backends that cannot provide them return `None` (adapters are then disabled).
+    fn hidden(&self) -> Option<&[f32]> {
+        None
+    }
 }
