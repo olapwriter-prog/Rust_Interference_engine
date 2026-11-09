@@ -7,6 +7,6 @@ cd "$(dirname "$0")/.."
 rustup target add aarch64-unknown-linux-musl >/dev/null
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="${LINKER:-aarch64-linux-gnu-gcc}" \
 RUSTFLAGS="-C target-feature=+crt-static" \
-  cargo build --release -p rie-cli --target aarch64-unknown-linux-musl
+  cargo build --release -p rie-cli -p rie-server --target aarch64-unknown-linux-musl
 OUT=target/aarch64-unknown-linux-musl/release/rie
-echo "Built $OUT ($(du -h "$OUT" | cut -f1)). Next: scripts/phone-bench.sh"
+echo "Built $OUT and $OUT-server ($(du -h "$OUT" | cut -f1)). Next: scripts/phone-bench.sh"

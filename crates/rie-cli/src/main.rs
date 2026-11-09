@@ -41,6 +41,12 @@ enum Cmd {
         wtype: String,
         #[arg(short, long)]
         out: PathBuf,
+        /// Training context length to record in the file.
+        #[arg(long)]
+        ctx: Option<usize>,
+        /// Chat template to embed: chatml or llama3 (default: none).
+        #[arg(long)]
+        chat_template: Option<String>,
     },
     /// Compute perplexity over a text file.
     Perplexity {
@@ -375,12 +381,17 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             println!("| {name} {} | {} | pp{} | {:.2} |", e.model.main_type().name(), e.backend_name(), a.n_prompt, mean(&pp));
             println!("| {name} {} | {} | tg{} | {:.2} |", e.model.main_type().name(), e.backend_name(), a.n_gen, mean(&tg));
         }
-        Cmd::Synth { preset, wtype, out } => {
+        Cmd::Synth { preset, wtype, out, ctx, chat_template } => {
             let wtype = parse_type(&wtype)?;
             let spec = match preset.strip_prefix("tiny-") {
                 Some(arch) => SyntheticSpec::tiny(arch, wtype),
                 None => SyntheticSpec::preset(&preset, wtype).ok_or("unknown preset")?,
             };
+            let mut spec = spec;
+            if let Some(c) = ctx {
+                spec.ctx = c;
+            }
+            spec.chat_template = chat_template;
             std::fs::write(&out, spec.build())?;
             println!("wrote {}", out.display());
         }

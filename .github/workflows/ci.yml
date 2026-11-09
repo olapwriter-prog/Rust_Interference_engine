@@ -29,6 +29,16 @@ jobs:
           ./target/release/rie synth tiny-llama --wtype Q4_0 -o tiny.gguf
           gcc -O1 -Icrates/rie-ffi/include crates/rie-ffi/tests/c_api.c -Ltarget/release -lrie -o c_api
           LD_LIBRARY_PATH=target/release ./c_api tiny.gguf
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Tool-harness agent loop against rie-server (tools, streaming, auto-reward, corrections)
+        run: |
+          cargo build --release -p rie-server
+          ./target/release/rie synth tiny-qwen2 --wtype Q8_0 --ctx 32768 --chat-template chatml -o harness.gguf
+          ./target/release/rie-server -m harness.gguf -c 32768 --port 8091 --rl --auto-reward --max-string 64 &
+          for i in $(seq 30); do curl -sf localhost:8091/health && break; sleep 1; done
+          node scripts/harness-check.mjs
 
   aarch64:
     name: AArch64 NEON / dotprod / i8mm (QEMU)
@@ -74,7 +84,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: rie-android-arm64-static
-          path: target/aarch64-unknown-linux-musl/release/rie
+          path: |
+            target/aarch64-unknown-linux-musl/release/rie
+            target/aarch64-unknown-linux-musl/release/rie-server
 
   mobile:
     name: Android / iOS build check

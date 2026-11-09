@@ -65,6 +65,20 @@ SmolLM), Gemma, Phi-3, Mistral, Granite, all auto-detected.
 On ARM CPUs, **Q4_0** is usually the fastest format (cheapest to unpack, plus i8mm tiles).
 **Q4_K_M** gives better quality at about the same size.
 
+## Tool calling, agents and on-device learning
+
+`rie-server` is an OpenAI-compatible server and a drop-in for `llama-server`, built for tool
+harnesses such as the stitaP tool harness:
+
+- **Grammar-constrained tool calls:** small models can't emit broken JSON, unknown tools or
+  wrong argument names.
+- **Online reinforcement learning:** a mixture of low-rank *correction experts* with a
+  learned router sits on the output layer. It learns from `/v1/feedback`,
+  `/v1/corrections` and, with `--auto-reward`, from tool errors the harness sends back.
+- **Phones:** included in the static ARM64 build, so it runs in Termux next to the agent.
+
+See [docs/tool-harness.md](docs/tool-harness.md).
+
 ## Repository layout
 
 ```
@@ -73,6 +87,7 @@ crates/rie-core   engine: GGUF, quant formats, SIMD kernels, thread pool, SoC to
 crates/rie-gpu    wgpu backend: WGSL kernels for the full forward pass
 crates/rie-cli    `rie` command-line tool
 crates/rie-ffi    C ABI (include/rie.h), Android JNI → librie.so / librie.a
+crates/rie-server OpenAI/llama-server-compatible server: constrained tool calls, online RL
 bindings/android  Kotlin wrapper (ai.rie.RieEngine) + example Activity
 bindings/ios      Swift package (RieEngine) over the C API
 scripts/          build-android.sh, build-ios.sh

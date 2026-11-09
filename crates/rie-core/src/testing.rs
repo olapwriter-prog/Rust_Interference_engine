@@ -118,6 +118,8 @@ pub struct SyntheticSpec {
     pub n_ff_exp: usize,
     /// Hidden size of the always-on shared expert (0 = none).
     pub n_ff_shexp: usize,
+    /// "chatml" or "llama3": embed that chat format's template and special tokens.
+    pub chat_template: Option<String>,
     pub seed: u64,
 }
 
@@ -146,6 +148,7 @@ impl SyntheticSpec {
             n_expert_used: 2,
             n_ff_exp: 256,
             n_ff_shexp: if arch == "qwen2moe" { 256 } else { 0 },
+            chat_template: None,
             seed: 1,
         }
     }
@@ -265,6 +268,15 @@ impl SyntheticSpec {
             tokens.push(format!("<0x{b:02X}>"));
             types.push(Value::I32(6));
         }
+        let specials: &[&str] = match self.chat_template.as_deref() {
+            Some("chatml") => &["<|im_start|>", "<|im_end|>"],
+            Some("llama3") => &["<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>"],
+            _ => &[],
+        };
+        for sp in specials {
+            tokens.push(sp.to_string());
+            types.push(Value::I32(3));
+        }
         let pieces = ["\u{2581}the", "\u{2581}a", "\u{2581}phone", "\u{2581}fast", "in", "er", "\u{2581}", "e", "t", "h", "o", "n"];
         for p in pieces {
             if tokens.len() < self.n_vocab {
@@ -286,6 +298,18 @@ impl SyntheticSpec {
         w.kv("tokenizer.ggml.bos_token_id", Value::U32(1));
         w.kv("tokenizer.ggml.eos_token_id", Value::U32(2));
         w.kv("tokenizer.ggml.unknown_token_id", Value::U32(0));
+        match self.chat_template.as_deref() {
+            Some("chatml") => {
+                w.kv(
+                    "tokenizer.chat_template",
+                    s("{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}"),
+                );
+            }
+            Some("llama3") => {
+                w.kv("tokenizer.chat_template", s("<|start_header_id|>{{ role }}<|end_header_id|>\n\n{{ content }}<|eot_id|>"));
+            }
+            _ => {}
+        }
 
         let (e, ff, qd, kvd, hd) = (
             self.n_embd as u64,
