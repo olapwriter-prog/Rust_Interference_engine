@@ -113,6 +113,9 @@ enum Lex {
         phase: NumPhase,
         len: usize,
         integer: bool,
+        /// digits in the exponent / integer part (bounded so values always fit an f64 / i64)
+        exp_digits: u8,
+        int_digits: u8,
     },
     Lit {
         word: &'static [u8],
@@ -358,12 +361,29 @@ impl JsonConstraint {
                     }
                 };
             }
-            Lex::Num { phase, len, integer } => {
+            Lex::Num { phase, len, integer, exp_digits, int_digits } => {
                 *len += 1;
                 if *len > MAX_NUMBER {
                     return false;
                 }
                 let integer = *integer;
+                if b.is_ascii_digit() {
+                    match phase {
+                        NumPhase::Exp | NumPhase::ExpSign | NumPhase::ExpDigits => {
+                            *exp_digits += 1;
+                            if *exp_digits > 2 {
+                                return false;
+                            }
+                        }
+                        NumPhase::Sign | NumPhase::Int => {
+                            *int_digits += 1;
+                            if integer && *int_digits > 18 {
+                                return false;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 let next = match (phase.clone(), b) {
                     (NumPhase::Sign, b'0') => Some(NumPhase::Int0),
                     (NumPhase::Sign, b'1'..=b'9') => Some(NumPhase::Int),
@@ -517,7 +537,8 @@ impl JsonConstraint {
                     b'0' => NumPhase::Int0,
                     _ => NumPhase::Int,
                 };
-                self.lex = Lex::Num { phase, len: 1, integer: ty == ArgType::Integer };
+                let int_digits = b.is_ascii_digit() as u8;
+                self.lex = Lex::Num { phase, len: 1, integer: ty == ArgType::Integer, exp_digits: 0, int_digits };
                 true
             }
             b't' if ok_type(ArgType::Boolean) => {
@@ -661,5 +682,9 @@ mod tests {
         assert!(!c.feed(b"[1]"));
         let mut c = JsonConstraint::any_object();
         assert!(!c.feed(br#"{"a": 01}"#));
+        // every accepted number must also parse as f64 (no huge exponents)
+        let mut c = JsonConstraint::any_object();
+        assert!(c.feed(br#"{"a": -7.5e30"#));
+        assert!(!c.accepts(b"9"));
     }
 }

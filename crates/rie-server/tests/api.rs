@@ -13,10 +13,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 fn server() -> u16 {
     static PORT: OnceLock<u16> = OnceLock::new();
-    *PORT.get_or_init(|| {
+    *PORT.get_or_init(start_server)
+}
+
+/// Start a fresh server (own engine and adapter) and return its port.
+fn start_server() -> u16 {
+    {
         let mut spec = SyntheticSpec::tiny("qwen2", GgmlType::Q8_0);
         spec.ctx = 4096;
-        let path = std::env::temp_dir().join(format!("rie-server-test-{}.gguf", std::process::id()));
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!("rie-server-test-{}-{n}.gguf", std::process::id()));
         std::fs::write(&path, spec.build()).unwrap();
         let cfg = ServerConfig {
             model: path,
@@ -34,11 +41,15 @@ fn server() -> u16 {
         let state = Arc::new(Mutex::new(State::new(engine, cfg)));
         std::thread::spawn(move || serve_on(listener, state));
         port
-    })
+    }
 }
 
 fn request(method: &str, path: &str, body: Option<&Value>) -> (u16, String) {
-    let mut s = TcpStream::connect(("127.0.0.1", server())).unwrap();
+    request_to(server(), method, path, body)
+}
+
+fn request_to(port: u16, method: &str, path: &str, body: Option<&Value>) -> (u16, String) {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     let b = body.map(|v| v.to_string()).unwrap_or_default();
     write!(
         s,
@@ -160,6 +171,13 @@ fn streaming_and_json_mode() {
 
 #[test]
 fn corrections_change_the_next_answer() {
+    // own server: other tests' feedback must not interfere with this check
+    let port = start_server();
+    let post = |path: &str, body: Value| -> Value {
+        let (st, b) = request_to(port, "POST", path, Some(&body));
+        assert_eq!(st, 200, "{path}: {b}");
+        serde_json::from_str(&b).unwrap()
+    };
     let ask = || {
         post(
             "/v1/chat/completions",
@@ -173,7 +191,7 @@ fn corrections_change_the_next_answer() {
     assert!(c["corrected_steps"].as_u64().unwrap() >= 1, "{c}");
     let after = ask()["choices"][0]["message"]["content"].as_str().unwrap().to_string();
     assert!(after.starts_with("phone"), "before {before:?}, after correction {after:?}");
-    let (_, b) = request("GET", "/v1/rl", None);
+    let (_, b) = request_to(port, "GET", "/v1/rl", None);
     let v: Value = serde_json::from_str(&b).unwrap();
     assert!(v["updates"].as_u64().unwrap() > 0);
 }
