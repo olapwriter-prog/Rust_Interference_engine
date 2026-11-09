@@ -266,7 +266,8 @@ impl GpuBackend {
 
         // ---- pipelines ----
         let mk = |src: String, label: &str| -> wgpu::ComputePipeline {
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(src.into()) });
+            let module = device
+                .create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(src.into()) });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(label),
                 layout: None,
@@ -278,7 +279,8 @@ impl GpuBackend {
         };
         let mut pipelines = Vec::new();
         for f in GpuFmt::ALL {
-            pipelines.push(mk(format!("{}{}", shaders::STEP, shaders::MATMUL.replace("DEQUANT", f.dequant_src())), &format!("matmul_{f:?}")));
+            pipelines
+                .push(mk(format!("{}{}", shaders::STEP, shaders::MATMUL.replace("DEQUANT", f.dequant_src())), &format!("matmul_{f:?}")));
         }
         for (src, name) in [
             (shaders::RMSNORM, "rmsnorm"),
@@ -298,7 +300,12 @@ impl GpuBackend {
         let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
         let mut keep: Vec<wgpu::Buffer> = Vec::new();
         let new_buf = |size: usize, label: &str| -> wgpu::Buffer {
-            device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: (size.max(4) * 4) as u64, usage: storage, mapped_at_creation: false })
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: (size.max(4) * 4) as u64,
+                usage: storage,
+                mapped_at_creation: false,
+            })
         };
         let init_f32 = |data: &[f32], label: &str| -> wgpu::Buffer {
             let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -306,7 +313,11 @@ impl GpuBackend {
         };
         let uniform = |words: [u32; 8]| -> wgpu::Buffer {
             let bytes: Vec<u8> = words.iter().flat_map(|v| v.to_le_bytes()).collect();
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("params"), contents: &bytes, usage: wgpu::BufferUsages::UNIFORM })
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("params"),
+                contents: &bytes,
+                usage: wgpu::BufferUsages::UNIFORM,
+            })
         };
         let step_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("step"),
@@ -353,7 +364,11 @@ impl GpuBackend {
                 debug_assert_eq!(words.len(), n * wpr);
                 let bytes: Vec<u8> = words.iter().flat_map(|v| v.to_le_bytes()).collect();
                 *vram += bytes.len();
-                let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: &bytes, usage: wgpu::BufferUsages::STORAGE });
+                let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: &bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
                 chunks.push(Chunk { buf, row_start: r0, n_rows: n });
                 r0 += n;
             }
@@ -369,7 +384,16 @@ impl GpuBackend {
             device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &entries })
         };
         // Records matmul dispatches for matrix `m` reading X (stride x_stride) into Y.
-        let matmul = |mats: &Vec<GpuMatrix>, dispatches: &mut Vec<Dispatch>, keep: &mut Vec<wgpu::Buffer>, m: usize, x: &wgpu::Buffer, x_stride: usize, y: &wgpu::Buffer, ld: usize, fixed_ntok: u32, rows_limit: usize| {
+        let matmul = |mats: &Vec<GpuMatrix>,
+                      dispatches: &mut Vec<Dispatch>,
+                      keep: &mut Vec<wgpu::Buffer>,
+                      m: usize,
+                      x: &wgpu::Buffer,
+                      x_stride: usize,
+                      y: &wgpu::Buffer,
+                      ld: usize,
+                      fixed_ntok: u32,
+                      rows_limit: usize| {
             let mat = &mats[m];
             let pi = GpuFmt::ALL.iter().position(|f| *f == mat.fmt).unwrap();
             for ch in &mat.chunks {
@@ -413,7 +437,11 @@ impl GpuBackend {
             // attention norm
             let attn_norm = init_f32(&lw.attn_norm, "attn_norm");
             let u = uniform([e as u32, 0, fbits(c.rms_eps), 0, 0, 0, 0, 0]);
-            dispatches.push(Dispatch { pipeline: P_RMS, bind: bind(&pipelines[P_RMS], &[&step_buf, &u, &x_buf, &attn_norm, &xn_buf]), size: Size::PerTok });
+            dispatches.push(Dispatch {
+                pipeline: P_RMS,
+                bind: bind(&pipelines[P_RMS], &[&step_buf, &u, &x_buf, &attn_norm, &xn_buf]),
+                size: Size::PerTok,
+            });
             keep.extend([u, attn_norm]);
             // QKV
             let mq = upload(&mut mats, &mut vram, &lw.wq, "wq")?;
@@ -424,10 +452,9 @@ impl GpuBackend {
             matmul(&mats, &mut dispatches, &mut keep, mv, &xn_buf, e, &v_buf, kvd, 0, usize::MAX);
             // head prep (bias + qk-norm + rope + q scale)
             let inv_buf = if swa { inv_swa.as_ref().unwrap_or(&inv_global) } else { &inv_global };
-            for (is_q, buf, n_heads, norm, bias, scale) in [
-                (true, &q_buf, c.n_head, &lw.q_norm, &lw.bq, c.attn_scale),
-                (false, &k_buf, c.n_head_kv, &lw.k_norm, &lw.bk, 1.0),
-            ] {
+            for (is_q, buf, n_heads, norm, bias, scale) in
+                [(true, &q_buf, c.n_head, &lw.q_norm, &lw.bq, c.attn_scale), (false, &k_buf, c.n_head_kv, &lw.k_norm, &lw.bk, 1.0)]
+            {
                 let mut nw = vec![0.0f32; hd];
                 if let Some(n) = norm {
                     nw.copy_from_slice(n);
@@ -456,7 +483,11 @@ impl GpuBackend {
             if let Some(bv) = &lw.bv {
                 let bb = init_f32(bv, "bv");
                 let u = uniform([kvd as u32, 0, 0, 0, 0, 0, 0, 0]);
-                dispatches.push(Dispatch { pipeline: P_BIAS, bind: bind(&pipelines[P_BIAS], &[&step_buf, &u, &v_buf, &bb]), size: Size::Elems(kvd as u32) });
+                dispatches.push(Dispatch {
+                    pipeline: P_BIAS,
+                    bind: bind(&pipelines[P_BIAS], &[&step_buf, &u, &v_buf, &bb]),
+                    size: Size::Elems(kvd as u32),
+                });
                 keep.extend([u, bb]);
             }
             // KV store
@@ -491,25 +522,41 @@ impl GpuBackend {
                 if let Some(w) = w {
                     let wb = init_f32(w, "post_norm");
                     let u = uniform([e as u32, 0, fbits(c.rms_eps), 0, 0, 0, 0, 0]);
-                    dispatches.push(Dispatch { pipeline: P_RMS_IP, bind: bind(&pipelines[P_RMS_IP], &[&step_buf, &u, &wb, &o_buf]), size: Size::PerTok });
+                    dispatches.push(Dispatch {
+                        pipeline: P_RMS_IP,
+                        bind: bind(&pipelines[P_RMS_IP], &[&step_buf, &u, &wb, &o_buf]),
+                        size: Size::PerTok,
+                    });
                     keep.extend([u, wb]);
                 }
                 let u = uniform([e as u32, 0, fbits(c.residual_scale), 0, 0, 0, 0, 0]);
-                dispatches.push(Dispatch { pipeline: P_RES, bind: bind(&pipelines[P_RES], &[&step_buf, &u, &x_buf, &o_buf]), size: Size::Elems(e as u32) });
+                dispatches.push(Dispatch {
+                    pipeline: P_RES,
+                    bind: bind(&pipelines[P_RES], &[&step_buf, &u, &x_buf, &o_buf]),
+                    size: Size::Elems(e as u32),
+                });
                 keep.push(u);
             };
             post(&mut dispatches, &mut keep, &lw.post_attn_norm);
             // FFN
             let ffn_norm = init_f32(&lw.ffn_norm, "ffn_norm");
             let u = uniform([e as u32, 0, fbits(c.rms_eps), 0, 0, 0, 0, 0]);
-            dispatches.push(Dispatch { pipeline: P_RMS, bind: bind(&pipelines[P_RMS], &[&step_buf, &u, &x_buf, &ffn_norm, &xn_buf]), size: Size::PerTok });
+            dispatches.push(Dispatch {
+                pipeline: P_RMS,
+                bind: bind(&pipelines[P_RMS], &[&step_buf, &u, &x_buf, &ffn_norm, &xn_buf]),
+                size: Size::PerTok,
+            });
             keep.extend([u, ffn_norm]);
             let mg = upload(&mut mats, &mut vram, &lw.w_gate, "w_gate")?;
             let mu = upload(&mut mats, &mut vram, &lw.w_up, "w_up")?;
             matmul(&mats, &mut dispatches, &mut keep, mg, &xn_buf, e, &gate_buf, ff, 0, usize::MAX);
             matmul(&mats, &mut dispatches, &mut keep, mu, &xn_buf, e, &up_buf, ff, 0, usize::MAX);
             let u = uniform([ff as u32, (c.act == Activation::GeluTanh) as u32, 0, 0, 0, 0, 0, 0]);
-            dispatches.push(Dispatch { pipeline: P_GLU, bind: bind(&pipelines[P_GLU], &[&step_buf, &u, &gate_buf, &up_buf]), size: Size::Elems(ff as u32) });
+            dispatches.push(Dispatch {
+                pipeline: P_GLU,
+                bind: bind(&pipelines[P_GLU], &[&step_buf, &u, &gate_buf, &up_buf]),
+                size: Size::Elems(ff as u32),
+            });
             keep.push(u);
             let md = upload(&mut mats, &mut vram, &lw.w_down, "w_down")?;
             matmul(&mats, &mut dispatches, &mut keep, md, &gate_buf, ff, &o_buf, e, 0, usize::MAX);
@@ -518,7 +565,11 @@ impl GpuBackend {
         // output head on the last token only
         let onorm = init_f32(&model.output_norm, "output_norm");
         let u = uniform([e as u32, 1, fbits(c.rms_eps), 0, 0, 0, 0, 0]);
-        dispatches.push(Dispatch { pipeline: P_RMS, bind: bind(&pipelines[P_RMS], &[&step_buf, &u, &x_buf, &onorm, &xn_buf]), size: Size::Fixed(1, 1, 1) });
+        dispatches.push(Dispatch {
+            pipeline: P_RMS,
+            bind: bind(&pipelines[P_RMS], &[&step_buf, &u, &x_buf, &onorm, &xn_buf]),
+            size: Size::Fixed(1, 1, 1),
+        });
         keep.extend([u, onorm]);
         let mout = upload(&mut mats, &mut vram, &model.output, "output")?;
         matmul(&mats, &mut dispatches, &mut keep, mout, &xn_buf, e, &logits_buf, nv, 1, nv);

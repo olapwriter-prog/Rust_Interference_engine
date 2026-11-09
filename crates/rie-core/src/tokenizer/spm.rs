@@ -112,9 +112,8 @@ impl Spm {
                 Some(&id) => out.push(id),
                 None => {
                     for &b in piece.as_bytes() {
-                        match self.byte_tokens[b as usize].or(self.unk) {
-                            Some(id) => out.push(id),
-                            None => {}
+                        if let Some(id) = self.byte_tokens[b as usize].or(self.unk) {
+                            out.push(id);
                         }
                     }
                 }

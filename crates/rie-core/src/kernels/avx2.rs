@@ -125,8 +125,14 @@ pub unsafe fn dot_q6_k(w: &[u8], a: &[BlockQ8K]) -> f32 {
             let v = [
                 _mm256_or_si256(_mm256_and_si256(ql0, m4), _mm256_slli_epi16(_mm256_and_si256(qh, m3), 4)),
                 _mm256_or_si256(_mm256_and_si256(ql1, m4), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 2), m3), 4)),
-                _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql0, 4), m4), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 4), m3), 4)),
-                _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql1, 4), m4), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 6), m3), 4)),
+                _mm256_or_si256(
+                    _mm256_and_si256(_mm256_srli_epi16(ql0, 4), m4),
+                    _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 4), m3), 4),
+                ),
+                _mm256_or_si256(
+                    _mm256_and_si256(_mm256_srli_epi16(ql1, 4), m4),
+                    _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 6), m3), 4),
+                ),
             ];
             let aq = ab.qs.as_ptr().add(128 * n);
             for (k, vk) in v.iter().enumerate() {

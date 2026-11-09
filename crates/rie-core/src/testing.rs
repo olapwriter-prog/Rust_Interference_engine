@@ -47,11 +47,7 @@ pub fn random_weight(rng: &mut Rng, ty: GgmlType, rows: usize, cols: usize, gain
     match ty {
         GgmlType::F32 => rng.vec(rows * cols, 0.1 * gain).iter().flat_map(|v| v.to_le_bytes()).collect(),
         GgmlType::F16 => rng.vec(rows * cols, 0.1 * gain).iter().flat_map(|v| f16::from_f32(*v).to_bits().to_le_bytes()).collect(),
-        GgmlType::BF16 => rng
-            .vec(rows * cols, 0.1 * gain)
-            .iter()
-            .flat_map(|v| half::bf16::from_f32(*v).to_bits().to_le_bytes())
-            .collect(),
+        GgmlType::BF16 => rng.vec(rows * cols, 0.1 * gain).iter().flat_map(|v| half::bf16::from_f32(*v).to_bits().to_le_bytes()).collect(),
         _ => {
             let n_blocks = rows * cols / ty.block_size();
             let bb = ty.block_bytes();
@@ -75,7 +71,10 @@ pub fn random_weight(rng: &mut Rng, ty: GgmlType, rows: usize, cols: usize, gain
             for b in 0..n_blocks {
                 for (i, &off) in scale_offsets(ty).iter().enumerate() {
                     let mut v = (rng.f32() * 0.5 + 0.5) * scale;
-                    if i == 0 && matches!(ty, GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q8_0 | GgmlType::Q3_K | GgmlType::Q6_K) && rng.f32() < 0.3 {
+                    if i == 0
+                        && matches!(ty, GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q8_0 | GgmlType::Q3_K | GgmlType::Q6_K)
+                        && rng.f32() < 0.3
+                    {
                         v = -v;
                     }
                     if i == 1 && matches!(ty, GgmlType::Q4_1 | GgmlType::Q5_1) {
@@ -167,7 +166,19 @@ impl SyntheticSpec {
         s.rope_dim = if arch == "phi3" { 96 } else { hd };
         s.ctx = 4096;
         s.swa_window = if arch == "gemma3" { 512 } else { 0 };
-        s.tied_output = matches!(name, "llama-3.2-1b" | "llama-3.2-3b" | "qwen2.5-0.5b" | "qwen2.5-1.5b" | "qwen3-0.6b" | "qwen3-1.7b" | "qwen3-4b" | "gemma-3-1b" | "phi-4-mini" | "smollm2-360m");
+        s.tied_output = matches!(
+            name,
+            "llama-3.2-1b"
+                | "llama-3.2-3b"
+                | "qwen2.5-0.5b"
+                | "qwen2.5-1.5b"
+                | "qwen3-0.6b"
+                | "qwen3-1.7b"
+                | "qwen3-4b"
+                | "gemma-3-1b"
+                | "phi-4-mini"
+                | "smollm2-360m"
+        );
         s.embd_type = if wtype.block_size() > 1 { GgmlType::Q6_K } else { wtype };
         if e % 256 != 0 || ff % 256 != 0 {
             // k-quants need multiples of 256: fall back like llama-quantize does
@@ -254,10 +265,14 @@ impl SyntheticSpec {
         w.kv("tokenizer.ggml.eos_token_id", Value::U32(2));
         w.kv("tokenizer.ggml.unknown_token_id", Value::U32(0));
 
-        let (e, ff, qd, kvd, hd) = (self.n_embd as u64, self.n_ff as u64, (self.n_head * self.head_dim) as u64, (self.n_head_kv * self.head_dim) as u64, self.head_dim as u64);
-        let norm = |rng: &mut Rng, n: usize| -> Vec<u8> {
-            (0..n).flat_map(|_| (1.0 + 0.1 * rng.sym()).to_le_bytes()).collect()
-        };
+        let (e, ff, qd, kvd, hd) = (
+            self.n_embd as u64,
+            self.n_ff as u64,
+            (self.n_head * self.head_dim) as u64,
+            (self.n_head_kv * self.head_dim) as u64,
+            self.head_dim as u64,
+        );
+        let norm = |rng: &mut Rng, n: usize| -> Vec<u8> { (0..n).flat_map(|_| (1.0 + 0.1 * rng.sym()).to_le_bytes()).collect() };
         let vec_f32 = |rng: &mut Rng, n: usize, sc: f32| -> Vec<u8> { rng.vec(n, sc).iter().flat_map(|v| v.to_le_bytes()).collect() };
         let wt = self.wtype;
         let mat = |rng: &mut Rng, rows: u64, cols: u64, ty: GgmlType| random_weight(rng, ty, rows as usize, cols as usize, 1.0);

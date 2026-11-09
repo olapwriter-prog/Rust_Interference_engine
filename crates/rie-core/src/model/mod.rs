@@ -137,10 +137,8 @@ impl Model {
             }
             layers.push(lw);
         }
-        if output.cols != cfg.n_embd || output.rows != cfg.n_vocab {
-            if output.rows < cfg.n_vocab {
-                bail!(Format, "output has {} rows < vocabulary {}", output.rows, cfg.n_vocab);
-            }
+        if output.cols != cfg.n_embd || output.rows < cfg.n_vocab {
+            bail!(Format, "output matrix {}x{} does not cover vocabulary {} x {}", output.rows, output.cols, cfg.n_vocab, cfg.n_embd);
         }
         Ok(Model { cfg, token_embd, output_norm, output, rope_factors, layers, gguf })
     }

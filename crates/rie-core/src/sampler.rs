@@ -166,7 +166,8 @@ mod tests {
 
     #[test]
     fn sampling_distribution_is_reasonable() {
-        let mut s = Sampler::new(SamplerParams { temperature: 1.0, top_k: 0, top_p: 1.0, min_p: 0.0, repeat_penalty: 1.0, ..Default::default() });
+        let mut s =
+            Sampler::new(SamplerParams { temperature: 1.0, top_k: 0, top_p: 1.0, min_p: 0.0, repeat_penalty: 1.0, ..Default::default() });
         let mut hits = [0usize; 2];
         for _ in 0..4000 {
             let t = s.sample(&mut vec![0.0, (3.0f32).ln()], &[]);

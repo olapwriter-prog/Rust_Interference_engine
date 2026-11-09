@@ -231,11 +231,7 @@ impl GgufFile {
             let val = r.value(ty, 0)?;
             metadata.insert(key, val);
         }
-        let alignment = metadata
-            .get("general.alignment")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_ALIGNMENT)
-            .max(1);
+        let alignment = metadata.get("general.alignment").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_ALIGNMENT).max(1);
 
         let mut tensors = Vec::with_capacity(n_tensors);
         for _ in 0..n_tensors {
@@ -249,8 +245,7 @@ impl GgufFile {
                 dims.push(r.u64()?);
             }
             let ty_id = r.u32()?;
-            let ty = GgmlType::from_id(ty_id)
-                .ok_or_else(|| Error::Unsupported(format!("tensor {name} uses ggml type id {ty_id}")))?;
+            let ty = GgmlType::from_id(ty_id).ok_or_else(|| Error::Unsupported(format!("tensor {name} uses ggml type id {ty_id}")))?;
             let rel = r.u64()?;
             tensors.push((name, dims, ty, rel));
         }
@@ -352,11 +347,7 @@ pub mod writer {
         }
         pub fn tensor(&mut self, name: &str, dims: &[u64], ty: GgmlType, data: Vec<u8>) -> &mut Self {
             let n: u64 = dims.iter().product();
-            assert_eq!(
-                data.len() as u64,
-                n / ty.block_size() as u64 * ty.block_bytes() as u64,
-                "tensor {name} data size mismatch"
-            );
+            assert_eq!(data.len() as u64, n / ty.block_size() as u64 * ty.block_bytes() as u64, "tensor {name} data size mismatch");
             self.tensors.push((name.to_string(), dims.to_vec(), ty, data));
             self
         }

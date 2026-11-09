@@ -68,7 +68,15 @@ pub extern "C" fn rie_default_config() -> RieConfig {
 #[no_mangle]
 pub extern "C" fn rie_default_sampling() -> RieSampling {
     let d = SamplerParams::default();
-    RieSampling { temperature: d.temperature, top_k: d.top_k as i32, top_p: d.top_p, min_p: d.min_p, repeat_penalty: d.repeat_penalty, seed: 0, max_tokens: 512 }
+    RieSampling {
+        temperature: d.temperature,
+        top_k: d.top_k as i32,
+        top_p: d.top_p,
+        min_p: d.min_p,
+        repeat_penalty: d.repeat_penalty,
+        seed: 0,
+        max_tokens: 512,
+    }
 }
 
 fn write_err(buf: *mut c_char, len: usize, msg: &str) {
@@ -100,7 +108,9 @@ pub(crate) fn load_engine(path: &str, cfg: &RieConfig) -> Result<RieEngine, Stri
     #[cfg(feature = "gpu")]
     if cfg.use_gpu != 0 {
         match rie_gpu::GpuBackend::new(model.clone(), rie_gpu::GpuConfig { n_ctx, max_batch: ecfg.n_batch.min(32), ..Default::default() }) {
-            Ok(b) => return Ok(RieEngine { engine: Engine::with_backend(model, tok, Box::new(b)), cancel: Arc::new(AtomicBool::new(false)) }),
+            Ok(b) => {
+                return Ok(RieEngine { engine: Engine::with_backend(model, tok, Box::new(b)), cancel: Arc::new(AtomicBool::new(false)) })
+            }
             Err(e) => eprintln!("rie: GPU backend unavailable ({e}), falling back to CPU"),
         }
     }
@@ -160,7 +170,11 @@ pub unsafe extern "C" fn rie_reset(e: *mut RieEngine) {
 }
 
 pub(crate) fn to_params(s: &RieSampling) -> GenerateParams {
-    let seed = if s.seed == 0 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1) } else { s.seed };
+    let seed = if s.seed == 0 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)
+    } else {
+        s.seed
+    };
     GenerateParams {
         max_tokens: s.max_tokens.max(1) as usize,
         sampler: SamplerParams {
@@ -304,7 +318,8 @@ pub unsafe extern "C" fn rie_bench(e: *mut RieEngine, n_prompt: i32, n_gen: i32,
 pub(crate) fn device_info_string() -> String {
     let topo = rie_core::cpu::CpuTopology::detect();
     #[allow(unused_mut)]
-    let mut s = format!("{topo}SIMD: {} (kernels: {})\n", rie_core::CpuFeatures::get().describe(), rie_core::CpuFeatures::get().kernel_name());
+    let mut s =
+        format!("{topo}SIMD: {} (kernels: {})\n", rie_core::CpuFeatures::get().describe(), rie_core::CpuFeatures::get().kernel_name());
     #[cfg(feature = "gpu")]
     for a in rie_gpu::list_adapters() {
         s += &format!("GPU: {a}\n");

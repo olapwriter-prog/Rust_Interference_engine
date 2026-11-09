@@ -49,7 +49,13 @@ pub struct GenerateParams {
 
 impl Default for GenerateParams {
     fn default() -> Self {
-        GenerateParams { max_tokens: 512, sampler: SamplerParams::default(), stop_strings: Vec::new(), parse_special: true, show_special: false }
+        GenerateParams {
+            max_tokens: 512,
+            sampler: SamplerParams::default(),
+            stop_strings: Vec::new(),
+            parse_special: true,
+            show_special: false,
+        }
     }
 }
 
@@ -76,10 +82,18 @@ pub struct GenerationStats {
 impl GenerationStats {
     pub fn prompt_tps(&self) -> f64 {
         let n = self.prompt_tokens - self.reused_tokens;
-        if self.prompt_time.is_zero() { 0.0 } else { n as f64 / self.prompt_time.as_secs_f64() }
+        if self.prompt_time.is_zero() {
+            0.0
+        } else {
+            n as f64 / self.prompt_time.as_secs_f64()
+        }
     }
     pub fn gen_tps(&self) -> f64 {
-        if self.gen_time.is_zero() { 0.0 } else { self.generated_tokens as f64 / self.gen_time.as_secs_f64() }
+        if self.gen_time.is_zero() {
+            0.0
+        } else {
+            self.generated_tokens as f64 / self.gen_time.as_secs_f64()
+        }
     }
 }
 
@@ -224,7 +238,12 @@ impl Engine {
         self.generate_from_tokens(&tokens, params, on_text)
     }
 
-    pub fn generate_from_tokens(&mut self, tokens: &[u32], params: &GenerateParams, mut on_text: impl FnMut(&str) -> bool) -> Result<GenerationStats> {
+    pub fn generate_from_tokens(
+        &mut self,
+        tokens: &[u32],
+        params: &GenerateParams,
+        mut on_text: impl FnMut(&str) -> bool,
+    ) -> Result<GenerationStats> {
         let t0 = Instant::now();
         let reused = self.eval_tokens(tokens)?;
         let prompt_time = t0.elapsed();
@@ -252,7 +271,9 @@ impl Engine {
             pending.push_str(&piece);
             full.push_str(&piece);
             if max_stop > 0 {
-                if let Some((i, _)) = params.stop_strings.iter().filter_map(|s| full.rfind(s.as_str()).map(|i| (i, s))).min_by_key(|(i, _)| *i) {
+                if let Some((i, _)) =
+                    params.stop_strings.iter().filter_map(|s| full.rfind(s.as_str()).map(|i| (i, s))).min_by_key(|(i, _)| *i)
+                {
                     // emit text before the stop string
                     let emitted = full.len() - pending.len();
                     if i > emitted {

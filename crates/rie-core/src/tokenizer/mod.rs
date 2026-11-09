@@ -32,8 +32,8 @@ impl TokenType {
 }
 
 enum Kind {
-    Spm(spm::Spm),
-    Bpe(bpe::Bpe),
+    Spm(Box<spm::Spm>),
+    Bpe(Box<bpe::Bpe>),
 }
 
 pub struct Tokenizer {
@@ -84,7 +84,7 @@ impl Tokenizer {
             "llama" | "gemma" => {
                 let add_space_prefix = g.get_bool("tokenizer.ggml.add_space_prefix").unwrap_or(model == "llama");
                 let unk = id("tokenizer.ggml.unknown_token_id");
-                Kind::Spm(spm::Spm::new(&tokens, &scores, &types, add_space_prefix, unk))
+                Kind::Spm(Box::new(spm::Spm::new(&tokens, &scores, &types, add_space_prefix, unk)))
             }
             "gpt2" => {
                 let merges: Vec<String> = g
@@ -94,7 +94,7 @@ impl Tokenizer {
                     .map(|v| v.as_str().unwrap_or("").to_string())
                     .collect();
                 let pre = g.get_str("tokenizer.ggml.pre").unwrap_or("default");
-                Kind::Bpe(bpe::Bpe::new(&merges, pre)?)
+                Kind::Bpe(Box::new(bpe::Bpe::new(&merges, pre)?))
             }
             other => bail!(Unsupported, "tokenizer model '{other}'"),
         };
@@ -108,10 +108,12 @@ impl Tokenizer {
             .filter(|(i, _)| !tokens[*i].is_empty())
             .map(|(i, _)| (tokens[i].clone(), i as u32))
             .collect();
-        specials.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        specials.sort_by_key(|s| std::cmp::Reverse(s.0.len()));
 
         let mut stop_tokens: Vec<u32> = [eos, eot].into_iter().flatten().collect();
-        for s in ["<|eot_id|>", "<|im_end|>", "<end_of_turn>", "<|end|>", "<|endoftext|>", "<|eom_id|>", "<|end_of_text|>", "</s>", "<|return|>"] {
+        for s in
+            ["<|eot_id|>", "<|im_end|>", "<end_of_turn>", "<|end|>", "<|endoftext|>", "<|eom_id|>", "<|end_of_text|>", "</s>", "<|return|>"]
+        {
             if let Some(&t) = token_to_id.get(s) {
                 if !stop_tokens.contains(&t) && matches!(types[t as usize], TokenType::Control | TokenType::UserDefined) {
                     stop_tokens.push(t);

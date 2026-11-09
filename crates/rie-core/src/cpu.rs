@@ -87,12 +87,7 @@ impl CpuTopology {
 
     /// Logical core ids of all non-efficiency cores, fastest first.
     pub fn performance_cores(&self) -> Vec<usize> {
-        let v: Vec<usize> = self
-            .clusters
-            .iter()
-            .filter(|c| c.kind != CoreKind::Efficiency)
-            .flat_map(|c| c.cores.iter().copied())
-            .collect();
+        let v: Vec<usize> = self.clusters.iter().filter(|c| c.kind != CoreKind::Efficiency).flat_map(|c| c.cores.iter().copied()).collect();
         if v.is_empty() {
             (0..self.n_logical).collect()
         } else {
@@ -121,9 +116,7 @@ impl CpuTopology {
                 clusters.push(Cluster { kind: CoreKind::Performance, cores: vec![id], max_freq_khz: freq, capacity: cap, uarch });
             }
         }
-        clusters.sort_by(|a, b| {
-            (b.capacity.unwrap_or(0), b.max_freq_khz).cmp(&(a.capacity.unwrap_or(0), a.max_freq_khz))
-        });
+        clusters.sort_by_key(|c| std::cmp::Reverse((c.capacity.unwrap_or(0), c.max_freq_khz)));
         let top_freq = clusters.first().map(|c| c.max_freq_khz).unwrap_or(0);
         let top_cap = clusters.iter().filter_map(|c| c.capacity).max();
         let n_clusters = clusters.len();

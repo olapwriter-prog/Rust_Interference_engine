@@ -7,11 +7,11 @@
 //! * x86_64 (emulators, ChromeOS, development): AVX2+FMA+F16C.
 //! * Everything else: portable scalar code.
 
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod avx2;
 pub mod matmul;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod neon;
-#[cfg(target_arch = "x86_64")]
-pub(crate) mod avx2;
 
 use crate::quant::{reference, BlockQ8K, BlockQ8_0, GgmlType, QK, QK_K};
 use std::sync::OnceLock;

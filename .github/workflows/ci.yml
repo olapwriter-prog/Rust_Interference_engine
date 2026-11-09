@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  x86_64:
+    name: x86_64 tests (AVX2 + scalar)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-features -- -D warnings
+      - run: cargo test -p rie-core -p rie-ffi
+      - name: scalar fallback kernels
+        run: cargo test -p rie-core
+        env:
+          RIE_DISABLE: simd
+      - name: C API smoke test
+        run: |
+          cargo build --release -p rie-cli -p rie-ffi
+          ./target/release/rie synth tiny-llama --wtype Q4_0 -o tiny.gguf
+          gcc -O1 -Icrates/rie-ffi/include crates/rie-ffi/tests/c_api.c -Ltarget/release -lrie -o c_api
+          LD_LIBRARY_PATH=target/release ./c_api tiny.gguf
+
+  aarch64:
+    name: AArch64 NEON / dotprod / i8mm (QEMU)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - run: sudo apt-get update && sudo apt-get install -y qemu-user gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+      - name: i8mm + dotprod (Armv8.6+, e.g. Snapdragon 8 Gen 1+, Dimensity 9000+, Apple A15+)
+        run: cargo test -p rie-core --target aarch64-unknown-linux-gnu
+      - name: dotprod only (Armv8.2-8.5, e.g. Cortex-A76/A77/A78)
+        run: cargo test -p rie-core --target aarch64-unknown-linux-gnu
+        env:
+          RIE_DISABLE: i8mm
+      - name: baseline NEON on Cortex-A53
+        run: cargo test -p rie-core --target aarch64-unknown-linux-gnu
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64 -cpu cortex-a53 -L /usr/aarch64-linux-gnu
+
+  gpu:
+    name: GPU backend (Mesa lavapipe Vulkan)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+      - run: cargo test -p rie-gpu
+
+  mobile:
+    name: Android / iOS build check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, x86_64-linux-android, aarch64-apple-ios
+      - run: cargo check -p rie-core -p rie-ffi --features rie-ffi/gpu --target aarch64-linux-android
+      - run: cargo check -p rie-core -p rie-ffi --features rie-ffi/gpu --target x86_64-linux-android
+      - run: cargo check -p rie-core -p rie-ffi --no-default-features --features rie-ffi/gpu --target aarch64-apple-ios

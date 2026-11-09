@@ -121,10 +121,7 @@ pub extern "system" fn Java_ai_rie_RieEngine_nativeGenerate(
         let Ok(js) = env.new_string(piece) else { return true };
         let r = env.call_method(&callback, "onToken", "(Ljava/lang/String;)Z", &[JValue::Object(&js)]);
         let _ = env.delete_local_ref(js);
-        match r.and_then(|v| v.z()) {
-            Ok(keep) => keep,
-            Err(_) => false,
-        }
+        r.and_then(|v| v.z()).unwrap_or_default()
     };
     let res = if is_chat { e.engine.chat(&msgs, &params, &mut on_text) } else { e.engine.generate(&prompt, &params, &mut on_text) };
     match res {

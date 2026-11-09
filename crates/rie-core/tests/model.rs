@@ -72,7 +72,13 @@ impl Reference {
         };
         let granite = a == "granite";
         let gf = |k: &str, d: f32| self.g.get_f32(&format!("{a}.{k}")).unwrap_or(d);
-        let embd_scale = if gemma { (e as f32).sqrt() } else if granite { gf("embedding_scale", 1.0) } else { 1.0 };
+        let embd_scale = if gemma {
+            (e as f32).sqrt()
+        } else if granite {
+            gf("embedding_scale", 1.0)
+        } else {
+            1.0
+        };
         let res_scale = if granite { gf("residual_scale", 1.0) } else { 1.0 };
         let attn_scale = if granite { gf("attention.scale", 1.0) } else { 1.0 / (hd as f32).sqrt() };
         let softcap_attn = if a == "gemma2" { Some(50.0f32) } else { None };
@@ -105,7 +111,8 @@ impl Reference {
         let (onorm, _) = self.t("output_norm.weight").unwrap();
         let (out_w, out_ty) = self.t("output.weight").unwrap_or_else(|| (embd.clone(), embd_ty));
         let n = tokens.len();
-        let mut xs: Vec<Vec<f32>> = tokens.iter().map(|&t| embd[t as usize * e..(t as usize + 1) * e].iter().map(|v| v * embd_scale).collect()).collect();
+        let mut xs: Vec<Vec<f32>> =
+            tokens.iter().map(|&t| embd[t as usize * e..(t as usize + 1) * e].iter().map(|v| v * embd_scale).collect()).collect();
         let qd = nh * hd;
         let kvd = nkv * hd;
         for il in 0..nl {
@@ -180,10 +187,13 @@ impl Reference {
                         })
                         .collect();
                     let m = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let sum: f32 = sc.iter_mut().map(|s| {
-                        *s = (*s - m).exp();
-                        *s
-                    }).sum();
+                    let sum: f32 = sc
+                        .iter_mut()
+                        .map(|s| {
+                            *s = (*s - m).exp();
+                            *s
+                        })
+                        .sum();
                     for (jj, j) in (lo..=i).enumerate() {
                         for d in 0..hd {
                             att[hh * hd + d] += sc[jj] / sum * vs[j][g * hd + d];
@@ -221,7 +231,8 @@ impl Reference {
             .map(|x| {
                 let h = rms(x, &onorm);
                 let hq = if emulate { quantize_like_engine(out_ty, &h) } else { h };
-                let mut l: Vec<f32> = out_w.chunks(e).map(|r| r.iter().zip(&hq).map(|(a, b)| (*a as f64) * (*b as f64)).sum::<f64>() as f32).collect();
+                let mut l: Vec<f32> =
+                    out_w.chunks(e).map(|r| r.iter().zip(&hq).map(|(a, b)| (*a as f64) * (*b as f64)).sum::<f64>() as f32).collect();
                 for v in l.iter_mut() {
                     *v /= logit_scale;
                     if let Some(c) = softcap_final {
@@ -236,12 +247,8 @@ impl Reference {
 
 fn check_arch(spec: SyntheticSpec, tol: f32, threads: usize) {
     let bytes = spec.build();
-    let reference = Reference {
-        g: GgufFile::from_bytes(bytes.clone()).unwrap(),
-        arch: spec.arch.clone(),
-        emulate_act_quant: true,
-        wtype: spec.wtype,
-    };
+    let reference =
+        Reference { g: GgufFile::from_bytes(bytes.clone()).unwrap(), arch: spec.arch.clone(), emulate_act_quant: true, wtype: spec.wtype };
     let (model, _tok) = load_model_from(Arc::new(GgufFile::from_bytes(bytes).unwrap())).unwrap();
     let pool = Arc::new(ThreadPool::new(PoolConfig { n_threads: threads, cores: vec![], spin: Duration::from_micros(50) }));
     let tokens: Vec<u32> = (0..13u32).map(|i| (i * 37 + 5) % spec.n_vocab as u32).collect();
@@ -257,7 +264,9 @@ fn check_arch(spec: SyntheticSpec, tol: f32, threads: usize) {
         be.forward(&tokens[pos..end], pos, true, &mut logits).unwrap();
         for t in pos..end {
             let err = max_rel_err(&logits[(t - pos) * nv..(t - pos + 1) * nv], &expect[t]);
-            if std::env::var("RIE_PRINT_ERR").is_ok() { eprintln!("{} {:?} batched t{t} err {err}", spec.arch, spec.wtype); }
+            if std::env::var("RIE_PRINT_ERR").is_ok() {
+                eprintln!("{} {:?} batched t{t} err {err}", spec.arch, spec.wtype);
+            }
             assert!(err < tol, "{} {:?}: batched token {t}: rel err {err}", spec.arch, spec.wtype);
         }
         pos = end;
@@ -290,7 +299,17 @@ fn all_architectures_f16() {
 
 #[test]
 fn quantized_weights() {
-    for ty in [GgmlType::Q4_0, GgmlType::Q8_0, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K, GgmlType::Q5_0, GgmlType::Q4_1, GgmlType::Q3_K, GgmlType::Q2_K] {
+    for ty in [
+        GgmlType::Q4_0,
+        GgmlType::Q8_0,
+        GgmlType::Q4_K,
+        GgmlType::Q5_K,
+        GgmlType::Q6_K,
+        GgmlType::Q5_0,
+        GgmlType::Q4_1,
+        GgmlType::Q3_K,
+        GgmlType::Q2_K,
+    ] {
         // the reference emulates 8-bit activations and the f16 KV cache, so remaining
         // differences are float summation order and rare rounding-tie flips
         check_arch(SyntheticSpec::tiny("llama", ty), 0.03, 2);
@@ -315,18 +334,22 @@ fn engine_generation_prefix_reuse_and_determinism() {
     let params = GenerateParams { max_tokens: 20, sampler: SamplerParams::greedy(), ..Default::default() };
     let mut e1 = mk();
     let mut out1 = String::new();
-    let st = e1.generate("the phone is fast", &params, |s| {
-        out1.push_str(s);
-        true
-    }).unwrap();
+    let st = e1
+        .generate("the phone is fast", &params, |s| {
+            out1.push_str(s);
+            true
+        })
+        .unwrap();
     assert_eq!(st.reused_tokens, 0);
     assert!(st.generated_tokens > 0);
     // same prompt again: prefix reused, identical greedy output
     let mut out2 = String::new();
-    let st2 = e1.generate("the phone is fast", &params, |s| {
-        out2.push_str(s);
-        true
-    }).unwrap();
+    let st2 = e1
+        .generate("the phone is fast", &params, |s| {
+            out2.push_str(s);
+            true
+        })
+        .unwrap();
     assert!(st2.reused_tokens > 0, "expected KV reuse");
     assert_eq!(out1, out2);
     // fresh engine gives the same result
@@ -335,7 +358,8 @@ fn engine_generation_prefix_reuse_and_determinism() {
     e2.generate("the phone is fast", &params, |s| {
         out3.push_str(s);
         true
-    }).unwrap();
+    })
+    .unwrap();
     assert_eq!(out1, out3);
     // tokenizer round trip on the SPM byte vocabulary
     let ids = tok.encode("héllo phone", true, false);

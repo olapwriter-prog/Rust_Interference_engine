@@ -1,7 +1,7 @@
 mod common;
 use common::*;
 use rie_core::kernels::matmul::{formats_for, matmul, matmul_multi, MatmulJob, QuantActs};
-use rie_core::kernels::{dot_f16_f32, dot_f32, vec_dot, axpy_f16, f32_to_f16_slice, ActRow, CpuFeatures};
+use rie_core::kernels::{axpy_f16, dot_f16_f32, dot_f32, f32_to_f16_slice, vec_dot, ActRow, CpuFeatures};
 use rie_core::quant::*;
 use rie_core::tensor::Weight;
 use rie_core::threadpool::{PoolConfig, ThreadPool};
@@ -57,10 +57,7 @@ fn vec_dot_matches_dequantized_reference_for_all_types() {
                     dequantize_row(ty, &w, &mut wf);
                     wf.iter().zip(&x).map(|(a, b)| (a * b).abs()).sum()
                 };
-                assert!(
-                    (got - expect).abs() <= 1e-4 * mag + 1e-5,
-                    "{ty:?} n={n} trial={trial}: got {got}, expected {expect} (mag {mag})"
-                );
+                assert!((got - expect).abs() <= 1e-4 * mag + 1e-5, "{ty:?} n={n} trial={trial}: got {got}, expected {expect} (mag {mag})");
             }
         }
     }
@@ -111,11 +108,9 @@ fn scalar_reference_dots_agree_with_dequant() {
 fn quantizers_roundtrip() {
     let mut rng = Rng::new(3);
     let x = rng.vec(1024, 1.0);
-    for (ty, data, tol) in [
-        (GgmlType::Q8_0, quantize::q8_0(&x), 0.01),
-        (GgmlType::Q4_0, quantize::q4_0(&x), 0.15),
-        (GgmlType::F16, quantize::f16(&x), 0.001),
-    ] {
+    for (ty, data, tol) in
+        [(GgmlType::Q8_0, quantize::q8_0(&x), 0.01), (GgmlType::Q4_0, quantize::q4_0(&x), 0.15), (GgmlType::F16, quantize::f16(&x), 0.001)]
+    {
         let mut y = vec![0.0; x.len()];
         dequantize_row(ty, &data, &mut y);
         assert_close(&y, &x, tol, ty.name());

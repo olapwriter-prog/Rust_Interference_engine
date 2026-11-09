@@ -102,7 +102,11 @@ impl SampleArgs {
             top_p: self.top_p,
             min_p: self.min_p,
             repeat_penalty: self.repeat_penalty,
-            seed: if self.seed == 0 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64 } else { self.seed },
+            seed: if self.seed == 0 {
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64
+            } else {
+                self.seed
+            },
             ..Default::default()
         }
     }
@@ -181,7 +185,10 @@ fn build_engine(c: &Common, gguf: Arc<GgufFile>) -> Result<Engine, Box<dyn std::
     let backend: Box<dyn rie_core::Backend> = if c.gpu {
         #[cfg(feature = "gpu")]
         {
-            Box::new(rie_gpu::GpuBackend::new(model.clone(), rie_gpu::GpuConfig { n_ctx, max_batch: c.batch.min(64), ..Default::default() })?)
+            Box::new(rie_gpu::GpuBackend::new(
+                model.clone(),
+                rie_gpu::GpuConfig { n_ctx, max_batch: c.batch.min(64), ..Default::default() },
+            )?)
         }
         #[cfg(not(feature = "gpu"))]
         {
@@ -328,7 +335,8 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             let gguf = match &a.synthetic {
                 Some(name) => {
                     let wtype = parse_type(&a.wtype)?;
-                    let spec = SyntheticSpec::preset(name, wtype).ok_or_else(|| format!("unknown preset '{name}' (try one of {:?})", SyntheticSpec::PRESETS))?;
+                    let spec = SyntheticSpec::preset(name, wtype)
+                        .ok_or_else(|| format!("unknown preset '{name}' (try one of {:?})", SyntheticSpec::PRESETS))?;
                     eprintln!("building synthetic {name} ({:?} weights)…", spec.wtype);
                     Arc::new(GgufFile::from_bytes(spec.build())?)
                 }
@@ -371,7 +379,17 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn parse_type(s: &str) -> Result<GgmlType, String> {
     let up = s.to_uppercase();
-    for t in [GgmlType::F32, GgmlType::F16, GgmlType::Q4_0, GgmlType::Q4_1, GgmlType::Q5_0, GgmlType::Q8_0, GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K] {
+    for t in [
+        GgmlType::F32,
+        GgmlType::F16,
+        GgmlType::Q4_0,
+        GgmlType::Q4_1,
+        GgmlType::Q5_0,
+        GgmlType::Q8_0,
+        GgmlType::Q4_K,
+        GgmlType::Q5_K,
+        GgmlType::Q6_K,
+    ] {
         if t.name() == up {
             return Ok(t);
         }

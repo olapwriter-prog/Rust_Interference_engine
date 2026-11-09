@@ -63,14 +63,7 @@ impl Weight {
     pub fn slice_rows(&self, start: usize, n: usize) -> Weight {
         assert!(start + n <= self.rows);
         let rb = self.row_bytes();
-        Weight {
-            ty: self.ty,
-            rows: n,
-            cols: self.cols,
-            ptr: unsafe { self.ptr.add(start * rb) },
-            len: n * rb,
-            _owner: self._owner.clone(),
-        }
+        Weight { ty: self.ty, rows: n, cols: self.cols, ptr: unsafe { self.ptr.add(start * rb) }, len: n * rb, _owner: self._owner.clone() }
     }
 
     pub fn dequant_row(&self, r: usize, out: &mut [f32]) {

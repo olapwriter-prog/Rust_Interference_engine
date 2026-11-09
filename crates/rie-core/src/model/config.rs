@@ -91,9 +91,8 @@ impl ModelConfig {
 
     pub fn from_gguf(g: &GgufFile) -> Result<Self> {
         let arch_name = g.get_str("general.architecture").ok_or_else(|| Error::Missing("general.architecture".into()))?.to_string();
-        let arch = Arch::from_name(&arch_name).ok_or_else(|| {
-            Error::Unsupported(format!("architecture '{arch_name}' (supported: {})", Arch::supported().join(", ")))
-        })?;
+        let arch = Arch::from_name(&arch_name)
+            .ok_or_else(|| Error::Unsupported(format!("architecture '{arch_name}' (supported: {})", Arch::supported().join(", "))))?;
         let key = |k: &str| format!("{arch_name}.{k}");
         let req = |k: &str| -> Result<usize> {
             g.get_u64(&key(k)).map(|v| v as usize).ok_or_else(|| Error::Missing(format!("metadata {}", key(k))))

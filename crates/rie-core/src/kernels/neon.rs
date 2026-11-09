@@ -294,16 +294,10 @@ mod generic {
                 let a1 = vld1q_s8(aq.add(64 * j + 16));
                 let a2 = vld1q_s8(aq.add(64 * j + 32));
                 let a3 = vld1q_s8(aq.add(64 * j + 48));
-                let p1 = D::dot(
-                    D::dot(vdupq_n_s32(0), vreinterpretq_s8_u8(vandq_u8(q0, m4)), a0),
-                    vreinterpretq_s8_u8(vandq_u8(q1, m4)),
-                    a1,
-                );
-                let p2 = D::dot(
-                    D::dot(vdupq_n_s32(0), vreinterpretq_s8_u8(vshrq_n_u8(q0, 4)), a2),
-                    vreinterpretq_s8_u8(vshrq_n_u8(q1, 4)),
-                    a3,
-                );
+                let p1 =
+                    D::dot(D::dot(vdupq_n_s32(0), vreinterpretq_s8_u8(vandq_u8(q0, m4)), a0), vreinterpretq_s8_u8(vandq_u8(q1, m4)), a1);
+                let p2 =
+                    D::dot(D::dot(vdupq_n_s32(0), vreinterpretq_s8_u8(vshrq_n_u8(q0, 4)), a2), vreinterpretq_s8_u8(vshrq_n_u8(q1, 4)), a3);
                 sumi += hsum(p1) * sc[2 * j] as i32 + hsum(p2) * sc[2 * j + 1] as i32;
             }
             sum += d * sumi as f32 - dmin * summ as f32;

@@ -7,7 +7,7 @@ default-members = ["crates/rie-core", "crates/rie-cli", "crates/rie-gpu", "crate
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-rust-version = "1.80"
+rust-version = "1.82"
 repository = "https://github.com/olapwriter-prog/Rust_Interference_engine"
 
 [workspace.dependencies]

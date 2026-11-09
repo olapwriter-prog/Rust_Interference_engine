@@ -14,6 +14,8 @@
 //! * f16 KV cache, batched prompt processing, prompt-prefix reuse between turns,
 //!   pluggable backends (see the `rie-gpu` crate for Vulkan/Metal via wgpu).
 
+#![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+
 pub mod chat;
 pub mod cpu;
 pub mod engine;
@@ -24,9 +26,9 @@ pub mod model;
 pub mod ops;
 pub mod quant;
 pub mod sampler;
+pub mod tensor;
 #[doc(hidden)]
 pub mod testing;
-pub mod tensor;
 pub mod threadpool;
 pub mod tokenizer;
 
