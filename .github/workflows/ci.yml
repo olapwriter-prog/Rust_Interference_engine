@@ -59,6 +59,23 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers libvulkan1
       - run: cargo test -p rie-gpu
 
+  android-binary:
+    name: Static ARM64 rie binary for phones (adb / Termux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user
+      - run: scripts/build-android-static.sh
+      - name: smoke test under QEMU
+        run: qemu-aarch64 -cpu max target/aarch64-unknown-linux-musl/release/rie device
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rie-android-arm64-static
+          path: target/aarch64-unknown-linux-musl/release/rie
+
   mobile:
     name: Android / iOS build check
     runs-on: ubuntu-24.04

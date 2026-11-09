@@ -104,6 +104,22 @@ val engine = RieEngine.load(modelFile.path)          // threads = performance co
 engine.chat(listOf(RieEngine.ChatMessage("user", "Hi!"))) { piece -> show(piece); true }
 ```
 
+### Benchmark your phone (no NDK, no app)
+
+Download the `rie-android-arm64-static` artifact from the latest CI run, or build it
+yourself with `scripts/build-android-static.sh`. Then, with the phone connected over USB
+debugging:
+
+```bash
+scripts/phone-bench.sh                      # synthetic Qwen2.5-0.5B / Llama-3.2-1B / Qwen3-1.7B shapes
+scripts/phone-bench.sh my-model.gguf        # plus your own GGUF files
+PRESETS="llama-3.2-3b qwen3-4b" WTYPES=Q4_0 THREADS="auto 4 6 8" scripts/phone-bench.sh
+```
+
+It prints a markdown report: SoC and core clusters, prompt and generation tok/s across
+thread counts, the i8mm vs. dotprod vs. NEON kernel tiers, and the 8-bit KV cache. Set
+`ADB=local` to run it inside Termux on the phone itself.
+
 ### iOS
 
 ```bash
