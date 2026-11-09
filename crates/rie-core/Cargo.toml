@@ -1,0 +1,15 @@
+[package]
+name = "rie-core"
+description = "Rust Inference Engine core: GGUF loading, quantized SIMD kernels (NEON dotprod/i8mm, AVX2), big.LITTLE-aware threading and transformer runtime for mobile CPUs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+half = { workspace = true }
+memmap2 = { workspace = true }
+fancy-regex = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]

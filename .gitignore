@@ -1,0 +1,8 @@
+/target
+*.gguf
+*.so
+*.a
+*.dylib
+/bindings/android/app/build
+/bindings/android/.gradle
+/bindings/ios/build

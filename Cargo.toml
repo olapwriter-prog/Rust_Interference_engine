@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = ["crates/rie-core"]
+default-members = ["crates/rie-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.80"
+repository = "https://github.com/olapwriter-prog/Rust_Interference_engine"
+
+[workspace.dependencies]
+rie-core = { path = "crates/rie-core" }
+rie-gpu = { path = "crates/rie-gpu" }
+half = "2.4"
+memmap2 = "0.9"
+fancy-regex = "0.14"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+# Fast-to-build profile with optimisations, used by tests of numeric kernels.
+[profile.test]
+opt-level = 2
+
+[profile.bench-dev]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
