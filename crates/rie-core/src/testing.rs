@@ -112,6 +112,12 @@ pub struct SyntheticSpec {
     pub post_norms: bool,
     pub fused: bool,
     pub swa_window: usize,
+    /// Mixture of experts (0 = dense).
+    pub n_expert: usize,
+    pub n_expert_used: usize,
+    pub n_ff_exp: usize,
+    /// Hidden size of the always-on shared expert (0 = none).
+    pub n_ff_shexp: usize,
     pub seed: u64,
 }
 
@@ -136,6 +142,10 @@ impl SyntheticSpec {
             post_norms: matches!(arch, "gemma2" | "gemma3"),
             fused: arch == "phi3",
             swa_window: if matches!(arch, "gemma2" | "gemma3") { 5 } else { 0 },
+            n_expert: if matches!(arch, "qwen3moe" | "qwen2moe") { 8 } else { 0 },
+            n_expert_used: 2,
+            n_ff_exp: 256,
+            n_ff_shexp: if arch == "qwen2moe" { 256 } else { 0 },
             seed: 1,
         }
     }
@@ -153,6 +163,7 @@ impl SyntheticSpec {
             "gemma-3-1b" => ("gemma3", 262144, 1152, 26, 4, 1, 256, 6912),
             "phi-4-mini" => ("phi3", 200064, 3072, 32, 24, 8, 128, 8192),
             "smollm2-360m" => ("llama", 49152, 960, 32, 15, 5, 64, 2560),
+            "qwen3-30b-a3b" => ("qwen3moe", 151936, 2048, 48, 32, 4, 128, 6144),
             _ => return None,
         };
         let mut s = Self::tiny(arch, wtype);
@@ -166,6 +177,11 @@ impl SyntheticSpec {
         s.rope_dim = if arch == "phi3" { 96 } else { hd };
         s.ctx = 4096;
         s.swa_window = if arch == "gemma3" { 512 } else { 0 };
+        if arch == "qwen3moe" {
+            s.n_expert = 128;
+            s.n_expert_used = 8;
+            s.n_ff_exp = 768;
+        }
         s.tied_output = matches!(
             name,
             "llama-3.2-1b"
@@ -203,6 +219,7 @@ impl SyntheticSpec {
         "llama-3.2-3b",
         "qwen3-4b",
         "phi-4-mini",
+        "qwen3-30b-a3b",
     ];
 
     /// Build an in-memory GGUF image (SentencePiece byte vocabulary).
@@ -224,6 +241,11 @@ impl SyntheticSpec {
         w.kv(&format!("{a}.rope.dimension_count"), Value::U32(self.rope_dim as u32));
         w.kv(&format!("{a}.rope.freq_base"), Value::F32(10000.0));
         w.kv(&format!("{a}.attention.layer_norm_rms_epsilon"), Value::F32(1e-6));
+        if self.n_expert > 0 {
+            w.kv(&format!("{a}.expert_count"), Value::U32(self.n_expert as u32));
+            w.kv(&format!("{a}.expert_used_count"), Value::U32(self.n_expert_used as u32));
+            w.kv(&format!("{a}.expert_feed_forward_length"), Value::U32(self.n_ff_exp as u32));
+        }
         if self.swa_window > 0 {
             w.kv(&format!("{a}.attention.sliding_window"), Value::U32(self.swa_window as u32));
         }
@@ -309,13 +331,29 @@ impl SyntheticSpec {
                 w.tensor(&p("post_ffw_norm.weight"), &[e], GgmlType::F32, norm(&mut rng, self.n_embd));
             }
             w.tensor(&p("ffn_norm.weight"), &[e], GgmlType::F32, norm(&mut rng, self.n_embd));
-            if self.fused {
+            if self.n_expert > 0 {
+                let (ne, fx) = (self.n_expert as u64, self.n_ff_exp as u64);
+                // routers are stored as F32 in real MoE GGUFs; larger gain gives a peaked routing
+                let router: Vec<u8> = rng.vec((ne * e) as usize, 0.5).iter().flat_map(|v| v.to_le_bytes()).collect();
+                w.tensor(&p("ffn_gate_inp.weight"), &[e, ne], GgmlType::F32, router);
+                w.tensor(&p("ffn_gate_exps.weight"), &[e, fx, ne], wt, mat(&mut rng, fx * ne, e, wt));
+                w.tensor(&p("ffn_up_exps.weight"), &[e, fx, ne], wt, mat(&mut rng, fx * ne, e, wt));
+                w.tensor(&p("ffn_down_exps.weight"), &[fx, e, ne], wt, mat(&mut rng, e * ne, fx, wt));
+                if self.n_ff_shexp > 0 {
+                    let fs = self.n_ff_shexp as u64;
+                    w.tensor(&p("ffn_gate_shexp.weight"), &[e, fs], wt, mat(&mut rng, fs, e, wt));
+                    w.tensor(&p("ffn_up_shexp.weight"), &[e, fs], wt, mat(&mut rng, fs, e, wt));
+                    w.tensor(&p("ffn_down_shexp.weight"), &[fs, e], wt, mat(&mut rng, e, fs, wt));
+                    w.tensor(&p("ffn_gate_inp_shexp.weight"), &[e], GgmlType::F32, vec_f32(&mut rng, self.n_embd, 0.3));
+                }
+            } else if self.fused {
                 w.tensor(&p("ffn_up.weight"), &[e, 2 * ff], wt, mat(&mut rng, 2 * ff, e, wt));
+                w.tensor(&p("ffn_down.weight"), &[ff, e], wt, mat(&mut rng, e, ff, wt));
             } else {
                 w.tensor(&p("ffn_gate.weight"), &[e, ff], wt, mat(&mut rng, ff, e, wt));
                 w.tensor(&p("ffn_up.weight"), &[e, ff], wt, mat(&mut rng, ff, e, wt));
+                w.tensor(&p("ffn_down.weight"), &[ff, e], wt, mat(&mut rng, e, ff, wt));
             }
-            w.tensor(&p("ffn_down.weight"), &[ff, e], wt, mat(&mut rng, e, ff, wt));
         }
         w.to_bytes()
     }

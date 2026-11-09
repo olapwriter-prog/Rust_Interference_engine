@@ -64,6 +64,7 @@ impl Reference {
         let eps = 1e-6f32;
         let gemma = a.starts_with("gemma");
         let neox = a != "llama" && a != "granite";
+        let _ = ff;
         let swa_win = self.g.get_u64(&format!("{a}.attention.sliding_window")).unwrap_or(0) as usize;
         let pattern = match a {
             "gemma2" => 2,
@@ -122,15 +123,37 @@ impl Reference {
                 Some(f) => (f[..qd * e].to_vec(), f[qd * e..(qd + kvd) * e].to_vec(), f[(qd + kvd) * e..].to_vec()),
                 None => (get("attn_q.weight").unwrap(), get("attn_k.weight").unwrap(), get("attn_v.weight").unwrap()),
             };
-            let (wg, wu) = match get("ffn_gate.weight") {
-                Some(g) => (g, get("ffn_up.weight").unwrap()),
-                None => {
-                    let f = get("ffn_up.weight").unwrap();
-                    (f[..ff * e].to_vec(), f[ff * e..].to_vec())
-                }
+            let router = get("ffn_gate_inp.weight");
+            let (wg, wu, wd) = if router.is_some() {
+                (Vec::new(), Vec::new(), Vec::new())
+            } else {
+                let (wg, wu) = match get("ffn_gate.weight") {
+                    Some(g) => (g, get("ffn_up.weight").unwrap()),
+                    None => {
+                        let f = get("ffn_up.weight").unwrap();
+                        (f[..ff * e].to_vec(), f[ff * e..].to_vec())
+                    }
+                };
+                (wg, wu, get("ffn_down.weight").unwrap())
             };
             let wo = get("attn_output.weight").unwrap();
-            let wd = get("ffn_down.weight").unwrap();
+            let glu = |wg: &[f32], wu: &[f32], wd: &[f32], hid: usize, h: &[f32]| -> Vec<f32> {
+                let gt = matvec(wg, e, h);
+                let up = matvec(wu, e, h);
+                let act: Vec<f32> = gt
+                    .iter()
+                    .zip(&up)
+                    .map(|(g, u)| {
+                        let a = if gemma {
+                            0.5 * g * (1.0 + (0.7978845608f32 * (g + 0.044715 * g * g * g)).tanh())
+                        } else {
+                            g / (1.0 + (-g).exp())
+                        };
+                        a * u
+                    })
+                    .collect();
+                matvec(wd, hid, &act)
+            };
             let is_swa = pattern > 0 && swa_win > 0 && il % pattern < pattern - 1;
             let base = if a == "gemma3" && is_swa { 10000.0 } else { base_global };
             let mut qs = Vec::new();
@@ -206,21 +229,53 @@ impl Reference {
                 }
                 xs[i].iter_mut().zip(&o).for_each(|(a, b)| *a += b * res_scale);
                 let h = rms(&xs[i], &get("ffn_norm.weight").unwrap());
-                let gt = matvec(&wg, e, &h);
-                let up = matvec(&wu, e, &h);
-                let act: Vec<f32> = gt
-                    .iter()
-                    .zip(&up)
-                    .map(|(g, u)| {
-                        let a = if gemma {
-                            0.5 * g * (1.0 + (0.7978845608f32 * (g + 0.044715 * g * g * g)).tanh())
-                        } else {
-                            g / (1.0 + (-g).exp())
-                        };
-                        a * u
-                    })
-                    .collect();
-                let mut d = matvec(&wd, ff, &act);
+                let mut d = match &router {
+                    None => glu(&wg, &wu, &wd, ff, &h),
+                    Some(r) => {
+                        let ne = self.u("expert_count");
+                        let k = self.u("expert_used_count");
+                        let fx = self.u("expert_feed_forward_length");
+                        let (ga, ua, da) = (
+                            get("ffn_gate_exps.weight").unwrap(),
+                            get("ffn_up_exps.weight").unwrap(),
+                            get("ffn_down_exps.weight").unwrap(),
+                        );
+                        // router in exact f32 (it is an F32 tensor, so the engine does not quantize its input)
+                        let mut p: Vec<f32> = r.chunks(e).map(|row| row.iter().zip(&h).map(|(a, b)| a * b).sum()).collect();
+                        let mx = p.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let s: f32 = p
+                            .iter_mut()
+                            .map(|v| {
+                                *v = (*v - mx).exp();
+                                *v
+                            })
+                            .sum();
+                        p.iter_mut().for_each(|v| *v /= s);
+                        let mut order: Vec<usize> = (0..ne).collect();
+                        order.sort_by(|&a, &b| p[b].partial_cmp(&p[a]).unwrap());
+                        let top = &order[..k];
+                        let norm = if a == "qwen2moe" { 1.0 } else { top.iter().map(|&j| p[j]).sum() };
+                        let mut acc = vec![0.0f32; e];
+                        for &x in top {
+                            let y = glu(
+                                &ga[x * fx * e..(x + 1) * fx * e],
+                                &ua[x * fx * e..(x + 1) * fx * e],
+                                &da[x * e * fx..(x + 1) * e * fx],
+                                fx,
+                                &h,
+                            );
+                            acc.iter_mut().zip(&y).for_each(|(o, v)| *o += p[x] / norm * v);
+                        }
+                        if let Some(sg) = get("ffn_gate_shexp.weight") {
+                            let fs = sg.len() / e;
+                            let y = glu(&sg, &get("ffn_up_shexp.weight").unwrap(), &get("ffn_down_shexp.weight").unwrap(), fs, &h);
+                            let gw = get("ffn_gate_inp_shexp.weight").unwrap();
+                            let sc = 1.0 / (1.0 + (-gw.iter().zip(&h).map(|(a, b)| a * b).sum::<f32>()).exp());
+                            acc.iter_mut().zip(&y).for_each(|(o, v)| *o += sc * v);
+                        }
+                        acc
+                    }
+                };
                 if let Some(w) = get("post_ffw_norm.weight") {
                     d = rms(&d, &w);
                 }
@@ -250,6 +305,7 @@ fn check_arch(spec: SyntheticSpec, tol: f32, threads: usize) {
     let reference =
         Reference { g: GgufFile::from_bytes(bytes.clone()).unwrap(), arch: spec.arch.clone(), emulate_act_quant: true, wtype: spec.wtype };
     let (model, _tok) = load_model_from(Arc::new(GgufFile::from_bytes(bytes).unwrap())).unwrap();
+    assert_eq!(rie_core::model::is_moe(&model), spec.n_expert > 0, "MoE layout not detected");
     let pool = Arc::new(ThreadPool::new(PoolConfig { n_threads: threads, cores: vec![], spin: Duration::from_micros(50) }));
     let tokens: Vec<u32> = (0..13u32).map(|i| (i * 37 + 5) % spec.n_vocab as u32).collect();
     let expect = reference.logits(&tokens);
@@ -426,4 +482,17 @@ fn context_shift_keeps_generating_and_is_consistent() {
     fresh.eval_tokens(&kept).unwrap();
     let err = max_rel_err(&shifted, fresh.logits());
     assert!(err < 1e-4, "shifted vs fresh: {err}");
+}
+
+#[test]
+fn mixture_of_experts() {
+    check_arch(SyntheticSpec::tiny("qwen3moe", GgmlType::F16), 3e-3, 3);
+    check_arch(SyntheticSpec::tiny("qwen2moe", GgmlType::F16), 3e-3, 2);
+    // Mixtral layout: llama architecture with stacked expert tensors
+    let mut s = SyntheticSpec::tiny("llama", GgmlType::F16);
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.n_ff_exp = 512;
+    check_arch(s, 3e-3, 4);
+    check_arch(SyntheticSpec::tiny("qwen3moe", GgmlType::Q4_K), 0.03, 4);
 }

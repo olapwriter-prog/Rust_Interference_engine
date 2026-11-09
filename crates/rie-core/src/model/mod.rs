@@ -5,6 +5,11 @@ pub mod cpu;
 
 pub use config::{Activation, Arch, ModelConfig};
 
+/// True if any layer uses a mixture-of-experts feed-forward block.
+pub fn is_moe(m: &Model) -> bool {
+    m.layers.iter().any(|l| matches!(l.ffn, Ffn::Moe(_)))
+}
+
 use crate::error::{bail, Error, Result};
 use crate::gguf::{GgufFile, TensorInfo};
 use crate::quant::GgmlType;
@@ -24,10 +29,58 @@ pub struct LayerWeights {
     pub k_norm: Option<Vec<f32>>,
     pub post_attn_norm: Option<Vec<f32>>,
     pub ffn_norm: Vec<f32>,
-    pub w_gate: Weight,
-    pub w_up: Weight,
-    pub w_down: Weight,
+    pub ffn: Ffn,
     pub post_ffn_norm: Option<Vec<f32>>,
+}
+
+/// Gated feed-forward block `down(act(gate·x) * up·x)`.
+pub struct DenseFfn {
+    pub gate: Weight,
+    pub up: Weight,
+    pub down: Weight,
+}
+
+/// Mixture-of-experts feed-forward block (Mixtral, Qwen2-MoE, Qwen3-MoE).
+pub struct MoeFfn {
+    /// `[n_expert, n_embd]` router.
+    pub router: Weight,
+    pub experts: Vec<DenseFfn>,
+    /// Experts evaluated per token (top-k).
+    pub n_used: usize,
+    /// Renormalize the top-k router probabilities to sum to one.
+    pub norm_topk: bool,
+    /// Always-on shared expert (Qwen2-MoE), optionally scaled by `sigmoid(shared_gate · x)`.
+    pub shared: Option<DenseFfn>,
+    pub shared_gate: Option<Vec<f32>>,
+}
+
+pub enum Ffn {
+    Dense(DenseFfn),
+    Moe(MoeFfn),
+}
+
+impl Ffn {
+    /// Every weight matrix in the block.
+    pub fn weights(&self) -> Vec<&Weight> {
+        match self {
+            Ffn::Dense(d) => vec![&d.gate, &d.up, &d.down],
+            Ffn::Moe(m) => {
+                let mut v = vec![&m.router];
+                for d in m.experts.iter().chain(m.shared.iter()) {
+                    v.extend([&d.gate, &d.up, &d.down]);
+                }
+                v
+            }
+        }
+    }
+}
+
+impl LayerWeights {
+    pub fn all_weights(&self) -> Vec<&Weight> {
+        let mut v = vec![&self.wq, &self.wk, &self.wv, &self.wo];
+        v.extend(self.ffn.weights());
+        v
+    }
 }
 
 /// Loaded model: configuration + weights (zero-copy views into the GGUF mmap).
@@ -42,7 +95,10 @@ pub struct Model {
 }
 
 fn weight(g: &GgufFile, t: &TensorInfo) -> Result<Weight> {
-    if t.dims.len() > 2 && t.dims[2..].iter().any(|&d| d != 1) {
+    // 3-D tensors are only valid for stacked experts (`*_exps`): [cols, rows, n_expert]
+    // is stored expert after expert, i.e. as one `rows * n_expert` row-major matrix.
+    let stacked_ok = t.name.contains("_exps") && t.dims.len() == 3;
+    if t.dims.len() > 2 && !stacked_ok && t.dims[2..].iter().any(|&d| d != 1) {
         bail!(Unsupported, "tensor {} has shape {:?}", t.name, t.dims);
     }
     // SAFETY: the returned view is stored next to an Arc<GgufFile> that owns the mapping.
@@ -84,15 +140,62 @@ impl Model {
             } else {
                 (get(&p("attn_q.weight"))?, get(&p("attn_k.weight"))?, get(&p("attn_v.weight"))?)
             };
-            let (w_gate, w_up) = match opt(&p("ffn_gate.weight"))? {
-                Some(gw) => (gw, get(&p("ffn_up.weight"))?),
-                None => {
-                    let up = get(&p("ffn_up.weight"))?;
-                    if up.rows != 2 * cfg.n_ff {
-                        bail!(Unsupported, "layer {il}: missing ffn_gate and ffn_up is not fused");
-                    }
-                    (up.slice_rows(0, cfg.n_ff), up.slice_rows(cfg.n_ff, cfg.n_ff))
+            let ffn = if let Some(router) = opt(&p("ffn_gate_inp.weight"))? {
+                let (ne, ff) = (cfg.n_expert, cfg.n_ff_exp);
+                if ne == 0 || router.rows != ne || router.cols != cfg.n_embd {
+                    bail!(Format, "blk.{il}.ffn_gate_inp: shape {}x{} (expert_count {ne})", router.rows, router.cols);
                 }
+                let stacked = |name: &str, rows: usize, cols: usize| -> Result<Weight> {
+                    let w = get(&p(name))?;
+                    if w.rows != rows * ne || w.cols != cols {
+                        bail!(Format, "blk.{il}.{name}: shape {}x{}, expected {}x{cols}", w.rows, w.cols, rows * ne);
+                    }
+                    Ok(w)
+                };
+                let g_all = stacked("ffn_gate_exps.weight", ff, cfg.n_embd)?;
+                let u_all = stacked("ffn_up_exps.weight", ff, cfg.n_embd)?;
+                let d_all = stacked("ffn_down_exps.weight", cfg.n_embd, ff)?;
+                let experts = (0..ne)
+                    .map(|x| DenseFfn {
+                        gate: g_all.slice_rows(x * ff, ff),
+                        up: u_all.slice_rows(x * ff, ff),
+                        down: d_all.slice_rows(x * cfg.n_embd, cfg.n_embd),
+                    })
+                    .collect();
+                let shared = match opt(&p("ffn_gate_shexp.weight"))? {
+                    Some(gate) => Some(DenseFfn { gate, up: get(&p("ffn_up_shexp.weight"))?, down: get(&p("ffn_down_shexp.weight"))? }),
+                    None => None,
+                };
+                Ffn::Moe(MoeFfn {
+                    router,
+                    experts,
+                    n_used: cfg.n_expert_used.clamp(1, ne),
+                    norm_topk: cfg.expert_norm_topk,
+                    shared,
+                    shared_gate: opt_vec(&p("ffn_gate_inp_shexp.weight"))?,
+                })
+            } else {
+                let (gate, up) = match opt(&p("ffn_gate.weight"))? {
+                    Some(gw) => (gw, get(&p("ffn_up.weight"))?),
+                    None => {
+                        let up = get(&p("ffn_up.weight"))?;
+                        if up.rows != 2 * cfg.n_ff {
+                            bail!(Unsupported, "layer {il}: missing ffn_gate and ffn_up is not fused");
+                        }
+                        (up.slice_rows(0, cfg.n_ff), up.slice_rows(cfg.n_ff, cfg.n_ff))
+                    }
+                };
+                let down = get(&p("ffn_down.weight"))?;
+                for (name, w, rows, cols) in [
+                    ("ffn_gate", &gate, cfg.n_ff, cfg.n_embd),
+                    ("ffn_up", &up, cfg.n_ff, cfg.n_embd),
+                    ("ffn_down", &down, cfg.n_embd, cfg.n_ff),
+                ] {
+                    if w.rows != rows || w.cols != cols {
+                        bail!(Format, "blk.{il}.{name}: shape {}x{}, expected {rows}x{cols}", w.rows, w.cols);
+                    }
+                }
+                Ffn::Dense(DenseFfn { gate, up, down })
             };
             let lw = LayerWeights {
                 attn_norm: vec(&p("attn_norm.weight"))?,
@@ -107,13 +210,11 @@ impl Model {
                     Some(v) => v,
                     None => bail!(Missing, "tensor {}", p("ffn_norm.weight")),
                 },
-                w_down: get(&p("ffn_down.weight"))?,
+                ffn,
                 post_ffn_norm: opt_vec(&p("post_ffw_norm.weight"))?,
                 wq,
                 wk,
                 wv,
-                w_gate,
-                w_up,
             };
             // Shape validation catches mismatched metadata early with a clear message.
             let checks = [
@@ -121,9 +222,6 @@ impl Model {
                 ("attn_k", &lw.wk, kv_dim, cfg.n_embd),
                 ("attn_v", &lw.wv, kv_dim, cfg.n_embd),
                 ("attn_output", &lw.wo, cfg.n_embd, q_dim),
-                ("ffn_gate", &lw.w_gate, cfg.n_ff, cfg.n_embd),
-                ("ffn_up", &lw.w_up, cfg.n_ff, cfg.n_embd),
-                ("ffn_down", &lw.w_down, cfg.n_embd, cfg.n_ff),
             ];
             for (name, w, rows, cols) in checks {
                 if w.rows != rows || w.cols != cols {
@@ -150,7 +248,7 @@ impl Model {
             n += self.output.size_bytes();
         }
         for l in &self.layers {
-            for w in [&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down] {
+            for w in l.all_weights() {
                 n += w.size_bytes();
             }
         }
@@ -159,7 +257,8 @@ impl Model {
 
     pub fn n_params(&self) -> usize {
         let c = &self.cfg;
-        let per_layer = c.n_embd * (c.q_dim() + 2 * c.kv_dim()) + c.q_dim() * c.n_embd + 3 * c.n_embd * c.n_ff;
+        let ffn = if c.n_expert > 0 { c.n_expert * 3 * c.n_embd * c.n_ff_exp + c.n_expert * c.n_embd } else { 3 * c.n_embd * c.n_ff };
+        let per_layer = c.n_embd * (c.q_dim() + 2 * c.kv_dim()) + c.q_dim() * c.n_embd + ffn;
         c.n_vocab * c.n_embd * if std::ptr::eq(self.output.data().as_ptr(), self.token_embd.data().as_ptr()) { 1 } else { 2 }
             + c.n_layer * per_layer
     }
@@ -168,7 +267,7 @@ impl Model {
     pub fn main_type(&self) -> GgmlType {
         let mut counts: Vec<(GgmlType, usize)> = Vec::new();
         for l in &self.layers {
-            for w in [&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down] {
+            for w in l.all_weights() {
                 match counts.iter_mut().find(|(t, _)| *t == w.ty) {
                     Some((_, n)) => *n += w.size_bytes(),
                     None => counts.push((w.ty, w.size_bytes())),

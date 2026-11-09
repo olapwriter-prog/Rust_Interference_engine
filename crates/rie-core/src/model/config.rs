@@ -18,6 +18,10 @@ pub enum Arch {
     Gemma3,
     /// IBM Granite 3.x (Llama with residual/logit multipliers).
     Granite,
+    /// Qwen3 mixture-of-experts (Qwen3-30B-A3B, …).
+    Qwen3Moe,
+    /// Qwen1.5/Qwen2 mixture-of-experts with a shared expert.
+    Qwen2Moe,
 }
 
 impl Arch {
@@ -31,11 +35,13 @@ impl Arch {
             "gemma2" => Arch::Gemma2,
             "gemma3" => Arch::Gemma3,
             "granite" => Arch::Granite,
+            "qwen3moe" => Arch::Qwen3Moe,
+            "qwen2moe" => Arch::Qwen2Moe,
             _ => return None,
         })
     }
     pub fn supported() -> &'static [&'static str] {
-        &["llama", "mistral", "qwen2", "qwen3", "phi3", "gemma", "gemma2", "gemma3", "granite"]
+        &["llama", "mistral", "qwen2", "qwen3", "phi3", "gemma", "gemma2", "gemma3", "granite", "qwen3moe", "qwen2moe"]
     }
 }
 
@@ -76,6 +82,14 @@ pub struct ModelConfig {
     pub swa_window: usize,
     /// Every `swa_pattern`-th layer is global, the rest use the sliding window.
     pub swa_pattern: usize,
+    /// Mixture of experts: number of experts (0 = dense model).
+    pub n_expert: usize,
+    /// Experts evaluated per token.
+    pub n_expert_used: usize,
+    /// Hidden size of each expert.
+    pub n_ff_exp: usize,
+    /// Renormalize the selected experts' router probabilities.
+    pub expert_norm_topk: bool,
 }
 
 impl ModelConfig {
@@ -107,7 +121,11 @@ impl ModelConfig {
                 bail!(Unsupported, "value head dim {vl} != key head dim {head_dim}");
             }
         }
-        let n_ff = req("feed_forward_length")?;
+        let n_ff = g
+            .get_u64(&key("feed_forward_length"))
+            .or_else(|| g.get_u64(&key("expert_feed_forward_length")))
+            .map(|v| v as usize)
+            .ok_or_else(|| Error::Missing(format!("metadata {}", key("feed_forward_length"))))?;
         let n_vocab = g
             .get_arr("tokenizer.ggml.tokens")
             .map(|a| a.len())
@@ -138,7 +156,15 @@ impl ModelConfig {
             }
         }
 
-        let rope_neox = matches!(arch, Arch::Qwen2 | Arch::Qwen3 | Arch::Phi3 | Arch::Gemma | Arch::Gemma2 | Arch::Gemma3);
+        let rope_neox = matches!(
+            arch,
+            Arch::Qwen2 | Arch::Qwen3 | Arch::Phi3 | Arch::Gemma | Arch::Gemma2 | Arch::Gemma3 | Arch::Qwen3Moe | Arch::Qwen2Moe
+        );
+        let n_expert = g.get_u64(&key("expert_count")).unwrap_or(0) as usize;
+        let n_expert_used = g.get_u64(&key("expert_used_count")).unwrap_or(2) as usize;
+        let n_ff_exp = g.get_u64(&key("expert_feed_forward_length")).map(|v| v as usize).unwrap_or(n_ff);
+        // Qwen3-MoE and Mixtral renormalize the top-k weights; Qwen2-MoE does not.
+        let expert_norm_topk = g.get_bool(&key("expert_weights_norm")).unwrap_or(arch != Arch::Qwen2Moe);
         let gemma = matches!(arch, Arch::Gemma | Arch::Gemma2 | Arch::Gemma3);
         let act = if gemma { Activation::GeluTanh } else { Activation::Silu };
         let mut embd_scale = if gemma { (n_embd as f32).sqrt() } else { 1.0 };
@@ -213,6 +239,10 @@ impl ModelConfig {
             final_softcap,
             swa_window,
             swa_pattern,
+            n_expert,
+            n_expert_used,
+            n_ff_exp,
+            expert_norm_topk,
         })
     }
 }

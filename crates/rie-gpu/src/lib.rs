@@ -259,6 +259,9 @@ impl GpuBackend {
         .map_err(|e| gerr(&e))?;
         let max_binding = (limits.max_storage_buffer_binding_size).min(limits.max_buffer_size) as usize;
 
+        if rie_core::model::is_moe(&model) {
+            return Err(Error::Unsupported("mixture-of-experts models run on the CPU backend only".into()));
+        }
         let c = model.cfg.clone();
         let n_ctx = cfg.n_ctx;
         let max_batch = cfg.max_batch.clamp(1, 64).min(n_ctx);
@@ -556,8 +559,9 @@ impl GpuBackend {
                 size: Size::PerTok,
             });
             keep.extend([u, ffn_norm]);
-            let mg = upload(&mut mats, &mut vram, &lw.w_gate, "w_gate")?;
-            let mu = upload(&mut mats, &mut vram, &lw.w_up, "w_up")?;
+            let rie_core::model::Ffn::Dense(dffn) = &lw.ffn else { unreachable!("checked above") };
+            let mg = upload(&mut mats, &mut vram, &dffn.gate, "w_gate")?;
+            let mu = upload(&mut mats, &mut vram, &dffn.up, "w_up")?;
             matmul(&mats, &mut dispatches, &mut keep, mg, &xn_buf, e, &gate_buf, ff, 0, usize::MAX);
             matmul(&mats, &mut dispatches, &mut keep, mu, &xn_buf, e, &up_buf, ff, 0, usize::MAX);
             let u = uniform([ff as u32, (c.act == Activation::GeluTanh) as u32, 0, 0, 0, 0, 0, 0]);
@@ -567,7 +571,7 @@ impl GpuBackend {
                 size: Size::Elems(ff as u32),
             });
             keep.push(u);
-            let md = upload(&mut mats, &mut vram, &lw.w_down, "w_down")?;
+            let md = upload(&mut mats, &mut vram, &dffn.down, "w_down")?;
             matmul(&mats, &mut dispatches, &mut keep, md, &gate_buf, ff, &o_buf, e, 0, usize::MAX);
             post(&mut dispatches, &mut keep, &lw.post_ffn_norm);
         }

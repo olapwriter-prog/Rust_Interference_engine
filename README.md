@@ -42,6 +42,9 @@ X4 + 3×A720; on 8 Elite all 8 Oryon cores. These cases are covered by unit test
 | `phi3` | Phi-3/3.5-mini, **Phi-4-mini** (fused QKV, partial rotary) |
 | `gemma`, `gemma2`, `gemma3` | Gemma 2B/7B, Gemma 2 2B/9B (soft-capping, SWA), **Gemma 3 1B/4B** text (SWA 5:1, dual RoPE base) |
 | `granite` | IBM Granite 3.x dense |
+| `qwen3moe` | **Qwen3-30B-A3B** and other Qwen3 mixture-of-experts models (CPU backend) |
+| `qwen2moe` | Qwen1.5-MoE / Qwen2-MoE (shared expert, CPU backend) |
+| `llama` + `*_exps` tensors | Mixtral-style MoE (CPU backend) |
 
 **Quantizations:** F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K
 (so Q4_K_M, Q5_K_M, Q6_K and Q8_0 files all work). Fast int8 SIMD paths exist for Q4_0, Q4_1,
@@ -57,7 +60,7 @@ SmolLM), Gemma, Phi-3, Mistral, Granite, all auto-detected.
 |---|---|
 | 6–8 GB | Qwen3-0.6B/1.7B, Llama-3.2-1B, Gemma-3-1B, SmolLM2-1.7B |
 | 12 GB | Llama-3.2-3B, Qwen3-4B, Phi-4-mini, Gemma-3-4B (text) |
-| 16–24 GB | Qwen3-8B, Llama-3.1-8B (Q4) |
+| 16–24 GB | Qwen3-8B, Llama-3.1-8B (Q4); Qwen3-30B-A3B (Q3_K/Q4_K, ~3B active parameters per token, so it generates at roughly 3B-model speed) |
 
 On ARM CPUs, **Q4_0** is usually the fastest format (cheapest to unpack, plus i8mm tiles).
 **Q4_K_M** gives better quality at about the same size.
@@ -167,7 +170,10 @@ cargo test -p rie-core --target aarch64-unknown-linux-gnu   # needs qemu-user + 
   faster for token generation, which is limited by memory bandwidth. The GPU mainly helps
   prefill and frees up the CPU. On the GPU, formats other than F16/Q8_0/Q4_0/Q4_K/Q6_K are
   converted to Q8_0 at load time.
-* Not supported yet: MoE models (Qwen3-30B-A3B, gpt-oss), vision/audio towers, YaRN
+* MoE models run on the CPU backend only (the GPU backend reports them as unsupported, and
+  the C/Kotlin/Swift API falls back to the CPU). Each token is routed to its top-k experts,
+  and during prompt processing tokens are grouped by expert.
+* Not supported yet: gpt-oss and DeepSeek-style MoE, vision/audio towers, YaRN
   beyond the trained context, IQ*/TQ* quantizations, speculative
   decoding, SME2 kernels (Armv9.2: Dimensity 9500, 8 Elite Gen 5, Apple M4/A19).
 * When the context fills up during generation, the oldest half of the conversation (after

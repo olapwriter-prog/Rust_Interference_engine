@@ -1,6 +1,6 @@
 //! CPU backend: batched transformer forward pass with an f16 KV cache.
 
-use super::{Activation, Backend, Model};
+use super::{Activation, Backend, DenseFfn, Ffn, Model, MoeFfn};
 use crate::error::{bail, Result};
 use crate::kernels::matmul::{formats_for, matmul, matmul_multi, MatmulJob, QuantActs, SyncPtr};
 use crate::kernels::{axpy_f16, dot_f16_f32, f32_to_f16_slice, fp16_to_f32, vec_dot, ActRow};
@@ -66,6 +66,15 @@ pub struct CpuBackend {
     cos_swa: Vec<f32>,
     sin_swa: Vec<f32>,
     acts: QuantActs,
+    moe: MoeScratch,
+}
+
+/// Scratch buffers for mixture-of-experts layers.
+struct MoeScratch {
+    logits: Vec<f32>,
+    xg: Vec<f32>,
+    yg: Vec<f32>,
+    ys: Vec<f32>,
 }
 
 impl CpuBackend {
@@ -99,6 +108,16 @@ impl CpuBackend {
         let rope_swa = c.rope_base_swa.map(|b| Rope::new(c.rope_dim, c.rope_neox, b, 1.0, None));
         let half = c.rope_dim / 2;
         let nt = pool.n_threads();
+        // largest feed-forward hidden size across dense, expert and shared-expert blocks
+        let ff_max = model
+            .layers
+            .iter()
+            .flat_map(|l| match &l.ffn {
+                Ffn::Dense(d) => vec![d.gate.rows],
+                Ffn::Moe(m) => m.experts.iter().chain(m.shared.iter()).map(|d| d.gate.rows).collect(),
+            })
+            .max()
+            .unwrap_or(c.n_ff);
         CpuBackend {
             x: vec![0.0; max_batch * c.n_embd],
             xn: vec![0.0; max_batch * c.n_embd],
@@ -107,8 +126,14 @@ impl CpuBackend {
             v: vec![0.0; max_batch * c.kv_dim()],
             att: vec![0.0; max_batch * c.q_dim()],
             o: vec![0.0; max_batch * c.n_embd],
-            gate: vec![0.0; max_batch * c.n_ff],
-            up: vec![0.0; max_batch * c.n_ff],
+            gate: vec![0.0; max_batch * ff_max],
+            up: vec![0.0; max_batch * ff_max],
+            moe: MoeScratch {
+                logits: vec![0.0; max_batch * c.n_expert.max(1)],
+                xg: vec![0.0; max_batch * c.n_embd],
+                yg: vec![0.0; max_batch * c.n_embd],
+                ys: vec![0.0; max_batch * c.n_embd],
+            },
             scores: vec![0.0; nt * n_ctx],
             cos: vec![0.0; max_batch * half],
             sin: vec![0.0; max_batch * half],
@@ -152,7 +177,7 @@ impl CpuBackend {
         if pos0 + n > self.n_ctx {
             bail!(Runtime, "context window full ({} tokens)", self.n_ctx);
         }
-        let (e, qd, kvd, hd, ff) = (c.n_embd, c.q_dim(), c.kv_dim(), c.head_dim, c.n_ff);
+        let (e, qd, kvd, hd) = (c.n_embd, c.q_dim(), c.kv_dim(), c.head_dim);
         let half = c.rope_dim / 2;
 
         // Token embeddings.
@@ -271,32 +296,23 @@ impl CpuBackend {
 
             // ---- feed-forward block ----
             par_rmsnorm(pool, &mut self.xn, &self.x, &lw.ffn_norm, n, e, c.rms_eps);
-            self.acts.prepare(pool, &self.xn, n, e, &formats_for(&[&lw.w_gate, &lw.w_up]));
-            matmul_multi(
-                pool,
-                &self.acts,
-                &mut [
-                    MatmulJob { w: &lw.w_gate, out: &mut self.gate[..n * ff], ld: ff },
-                    MatmulJob { w: &lw.w_up, out: &mut self.up[..n * ff], ld: ff },
-                ],
-            );
-            {
-                let gp = SyncPtr(self.gate.as_mut_ptr());
-                let up = &self.up;
-                let act = c.act;
-                let chunk = 1024;
-                pool.for_each((n * ff).div_ceil(chunk), 4, |ci, _| {
-                    let s = ci * chunk;
-                    let end = (s + chunk).min(n * ff);
-                    let g = unsafe { std::slice::from_raw_parts_mut(gp.get().add(s), end - s) };
-                    match act {
-                        Activation::Silu => g.iter_mut().zip(&up[s..end]).for_each(|(a, b)| *a = silu(*a) * b),
-                        Activation::GeluTanh => g.iter_mut().zip(&up[s..end]).for_each(|(a, b)| *a = gelu_tanh(*a) * b),
-                    }
-                });
+            match &lw.ffn {
+                Ffn::Dense(d) => {
+                    dense_ffn(pool, &mut self.acts, d, &self.xn[..n * e], n, c.act, &mut self.gate, &mut self.up, &mut self.o[..n * e]);
+                }
+                Ffn::Moe(m) => moe_ffn(
+                    pool,
+                    &mut self.acts,
+                    m,
+                    &self.xn[..n * e],
+                    n,
+                    c.act,
+                    &mut self.moe,
+                    &mut self.gate,
+                    &mut self.up,
+                    &mut self.o[..n * e],
+                ),
             }
-            self.acts.prepare(pool, &self.gate, n, ff, &formats_for(&[&lw.w_down]));
-            matmul(pool, &self.acts, &lw.w_down, &mut self.o[..n * e]);
             if let Some(w) = &lw.post_ffn_norm {
                 for t in 0..n {
                     rmsnorm_inplace(&mut self.o[t * e..(t + 1) * e], w, c.rms_eps);
@@ -340,6 +356,101 @@ impl Backend for CpuBackend {
     }
     fn forward(&mut self, tokens: &[u32], pos: usize, all_logits: bool, logits: &mut [f32]) -> Result<()> {
         self.forward_impl(tokens, pos, all_logits, logits)
+    }
+}
+
+/// `out = down(act(gate·x) * up·x)` for `n` rows of `x`.
+#[allow(clippy::too_many_arguments)]
+fn dense_ffn(
+    pool: &ThreadPool,
+    acts: &mut QuantActs,
+    d: &DenseFfn,
+    x: &[f32],
+    n: usize,
+    act: Activation,
+    gate: &mut [f32],
+    up: &mut [f32],
+    out: &mut [f32],
+) {
+    let (e, ff) = (d.gate.cols, d.gate.rows);
+    acts.prepare(pool, x, n, e, &formats_for(&[&d.gate, &d.up]));
+    matmul_multi(
+        pool,
+        acts,
+        &mut [MatmulJob { w: &d.gate, out: &mut gate[..n * ff], ld: ff }, MatmulJob { w: &d.up, out: &mut up[..n * ff], ld: ff }],
+    );
+    {
+        let gp = SyncPtr(gate.as_mut_ptr());
+        let up = &*up;
+        let chunk = 1024;
+        pool.for_each((n * ff).div_ceil(chunk), 4, |ci, _| {
+            let s = ci * chunk;
+            let end = (s + chunk).min(n * ff);
+            let g = unsafe { std::slice::from_raw_parts_mut(gp.get().add(s), end - s) };
+            match act {
+                Activation::Silu => g.iter_mut().zip(&up[s..end]).for_each(|(a, b)| *a = silu(*a) * b),
+                Activation::GeluTanh => g.iter_mut().zip(&up[s..end]).for_each(|(a, b)| *a = gelu_tanh(*a) * b),
+            }
+        });
+    }
+    acts.prepare(pool, gate, n, ff, &formats_for(&[&d.down]));
+    matmul(pool, acts, &d.down, &mut out[..n * e]);
+}
+
+/// Mixture of experts: softmax router → top-k → (optionally renormalized) weighted sum of
+/// expert FFNs, plus an optional gated shared expert. Tokens are grouped per expert so
+/// each selected expert's weights are streamed once per batch.
+#[allow(clippy::too_many_arguments)]
+fn moe_ffn(
+    pool: &ThreadPool,
+    acts: &mut QuantActs,
+    m: &MoeFfn,
+    x: &[f32],
+    n: usize,
+    act: Activation,
+    sc: &mut MoeScratch,
+    gate: &mut [f32],
+    up: &mut [f32],
+    out: &mut [f32],
+) {
+    let e = m.router.cols;
+    let ne = m.router.rows;
+    acts.prepare(pool, x, n, e, &formats_for(&[&m.router]));
+    matmul(pool, acts, &m.router, &mut sc.logits[..n * ne]);
+    // routing
+    let mut assign: Vec<Vec<(usize, f32)>> = vec![Vec::new(); ne];
+    let mut idx: Vec<usize> = (0..ne).collect();
+    for t in 0..n {
+        let l = &mut sc.logits[t * ne..(t + 1) * ne];
+        crate::ops::softmax(l);
+        idx.sort_unstable_by(|&a, &b| l[b].partial_cmp(&l[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+        let top = &idx[..m.n_used];
+        let norm = if m.norm_topk { top.iter().map(|&i| l[i]).sum::<f32>() } else { 1.0 };
+        for &i in top {
+            assign[i].push((t, l[i] / norm));
+        }
+    }
+    out[..n * e].fill(0.0);
+    for (ex, list) in assign.iter().enumerate() {
+        if list.is_empty() {
+            continue;
+        }
+        let k = list.len();
+        for (j, &(t, _)) in list.iter().enumerate() {
+            sc.xg[j * e..(j + 1) * e].copy_from_slice(&x[t * e..(t + 1) * e]);
+        }
+        dense_ffn(pool, acts, &m.experts[ex], &sc.xg[..k * e], k, act, gate, up, &mut sc.yg[..k * e]);
+        for (j, &(t, w)) in list.iter().enumerate() {
+            out[t * e..(t + 1) * e].iter_mut().zip(&sc.yg[j * e..(j + 1) * e]).for_each(|(o, y)| *o += w * y);
+        }
+    }
+    if let Some(sh) = &m.shared {
+        dense_ffn(pool, acts, sh, x, n, act, gate, up, &mut sc.ys[..n * e]);
+        for t in 0..n {
+            let xt = &x[t * e..(t + 1) * e];
+            let scale = m.shared_gate.as_ref().map(|g| 1.0 / (1.0 + (-crate::kernels::dot_f32(g, xt)).exp())).unwrap_or(1.0);
+            out[t * e..(t + 1) * e].iter_mut().zip(&sc.ys[t * e..(t + 1) * e]).for_each(|(o, y)| *o += scale * y);
+        }
     }
 }
 
