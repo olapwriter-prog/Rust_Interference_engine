@@ -5,6 +5,7 @@
 //! {"tools": [
 //!   {"name": "weather.now", "description": "Current weather for a city", "category": "Weather",
 //!    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+//!    "keywords": ["వాతావరణం", "मौसम"],
 //!    "command": ["python3", "weather.py"], "timeout_ms": 5000},
 //!   {"name": "calendar.today", "description": "Today's events",
 //!    "http": "http://127.0.0.1:9000/calendar"}
@@ -36,6 +37,8 @@ pub struct HeadlessTool {
     pub name: String,
     pub description: String,
     pub category: Option<String>,
+    /// extra words (any language) that select this tool, e.g. ["వాతావరణం", "मौसम"]
+    pub keywords: Vec<String>,
     pub parameters: Value,
     pub exec: Exec,
     pub timeout: Duration,
@@ -125,6 +128,11 @@ pub fn load_manifest(path: &Path) -> Result<Vec<HeadlessTool>, String> {
         out.push(HeadlessTool {
             description: t.get("description").and_then(Value::as_str).unwrap_or("").to_string(),
             category: t.get("category").and_then(Value::as_str).map(str::to_string),
+            keywords: t
+                .get("keywords")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(|k| rie_core::text::normalize(k).to_lowercase()).collect())
+                .unwrap_or_default(),
             parameters: t.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object", "properties": {}})),
             exec,
             timeout: Duration::from_millis(t.get("timeout_ms").and_then(Value::as_u64).unwrap_or(10_000).clamp(10, 600_000)),

@@ -108,6 +108,11 @@ enum Lex {
         /// accumulated bytes when the value must match one of `allowed`
         buf: Vec<u8>,
         allowed: Option<Arc<Vec<Vec<u8>>>>,
+        /// UTF-8 continuation bytes still owed by the current character
+        u8need: u8,
+        /// lead byte whose first continuation byte is still to come (it has a narrower
+        /// valid range: no overlong forms, no surrogates, nothing above U+10FFFF)
+        u8lead: u8,
     },
     Num {
         phase: NumPhase,
@@ -198,7 +203,7 @@ impl JsonConstraint {
         }
     }
 
-    /// Limit string values to `n` bytes (after that the string must close). Guards against
+    /// Limit string values to `n` characters (after that the string must close). Guards against
     /// small models rambling inside an argument.
     pub fn with_max_string(mut self, n: usize) -> Self {
         self.max_string = n.max(1);
@@ -338,7 +343,32 @@ impl JsonConstraint {
         let winding = self.winding();
         // ---- inside a lexeme ----
         match &mut self.lex {
-            Lex::Str { is_key, esc, uni, len, buf, allowed } => {
+            Lex::Str { is_key, esc, uni, len, buf, allowed, u8need, u8lead } => {
+                // finish a multi-byte character first (Telugu letters are 3 bytes): only
+                // continuation bytes, and the length cap waits until the character is whole,
+                // so a string is never closed in the middle of a letter
+                if *u8need > 0 {
+                    let range = match std::mem::take(u8lead) {
+                        0xE0 => 0xA0..=0xBF,
+                        0xED => 0x80..=0x9F,
+                        0xF0 => 0x90..=0xBF,
+                        0xF4 => 0x80..=0x8F,
+                        _ => 0x80..=0xBF,
+                    };
+                    if !range.contains(&b) {
+                        return false;
+                    }
+                    *u8need -= 1;
+                    if let Some(al) = allowed {
+                        buf.push(b);
+                        return al.iter().any(|a| a.starts_with(buf));
+                    }
+                    if *is_key {
+                        buf.push(b);
+                    }
+                    return true;
+                }
+                // the cap counts characters, not bytes
                 *len += 1;
                 // at the length cap only the closing quote is allowed (never a dead end)
                 // free text = any string that is not restricted to an enum (values and the keys
@@ -388,7 +418,16 @@ impl JsonConstraint {
                         true
                     }
                     0..=0x1f => false,
+                    // stray continuation byte or invalid lead byte: never valid UTF-8
+                    0x80..=0xC1 | 0xF5..=0xFF => false,
                     _ => {
+                        *u8need = match b {
+                            0xC2..=0xDF => 1,
+                            0xE0..=0xEF => 2,
+                            0xF0..=0xF4 => 3,
+                            _ => 0,
+                        };
+                        *u8lead = if *u8need > 0 { b } else { 0 };
                         if let Some(al) = allowed {
                             buf.push(b);
                             al.iter().any(|a| a.starts_with(buf))
@@ -507,7 +546,7 @@ impl JsonConstraint {
                             return false;
                         }
                     }
-                    self.lex = Lex::Str { is_key: true, esc: false, uni: 0, len: 0, buf: Vec::new(), allowed };
+                    self.lex = Lex::Str { is_key: true, esc: false, uni: 0, len: 0, buf: Vec::new(), allowed, u8need: 0, u8lead: 0 };
                     true
                 }
                 (ObjSt::KeyOrEnd | ObjSt::CommaOrEnd, b'}') => {
@@ -574,7 +613,7 @@ impl JsonConstraint {
         let ok_type = |t: ArgType| (ty == ArgType::Any && !(winding && matches!(t, ArgType::Object | ArgType::Array))) || ty == t;
         match b {
             b'"' if ok_type(ArgType::String) => {
-                self.lex = Lex::Str { is_key: false, esc: false, uni: 0, len: 0, buf: Vec::new(), allowed };
+                self.lex = Lex::Str { is_key: false, esc: false, uni: 0, len: 0, buf: Vec::new(), allowed, u8need: 0, u8lead: 0 };
                 true
             }
             b'{' if ok_type(ArgType::Object) => {
@@ -761,6 +800,31 @@ mod tests {
         }
         assert!(c.is_complete(), "did not finish: {}", String::from_utf8_lossy(&out));
         assert!(out.len() < 400, "{}", String::from_utf8_lossy(&out));
+    }
+
+    #[test]
+    fn strings_never_break_a_multibyte_character() {
+        let sig = ToolSig { name: "f".into(), args: vec![("city".into(), ArgType::String)], required: vec![], enums: vec![] };
+        let mut c = JsonConstraint::tool_call(Arc::new(vec![sig]), "arguments").with_max_string(3);
+        assert!(c.feed(b"{\"name\":\"f\",\"arguments\":{\"city\":\""));
+        let te = "తెలుగు".as_bytes(); // 6 characters × 3 bytes
+        assert!(!c.accepts(&[0x80]), "stray continuation byte");
+        assert!(c.feed(&te[..1]));
+        assert!(!c.accepts(b"\""), "no closing quote mid-character");
+        assert!(!c.accepts(b"a"), "no new character mid-character");
+        // 3 characters fit the cap; the third may complete although the cap is reached
+        assert!(c.feed(&te[1..9]));
+        assert!(!c.accepts(&te[9..10]), "cap reached: no fourth character");
+        assert!(c.feed(b"\"}}") && c.is_complete());
+        // overlong forms and surrogates are not UTF-8 either
+        for bad in [[0xE0u8, 0x80], [0xED, 0xA0], [0xF0, 0x80], [0xF4, 0x90]] {
+            let mut c = JsonConstraint::tool_call(
+                Arc::new(vec![ToolSig { name: "f".into(), args: vec![("x".into(), ArgType::String)], required: vec![], enums: vec![] }]),
+                "arguments",
+            );
+            assert!(c.feed(b"{\"name\":\"f\",\"arguments\":{\"x\":\"") && c.feed(&bad[..1]));
+            assert!(!c.accepts(&bad[1..]), "{bad:02X?}");
+        }
     }
 
     #[test]

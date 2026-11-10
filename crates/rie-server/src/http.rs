@@ -105,6 +105,17 @@ pub fn write_text(w: &mut TcpStream, status: u16, content_type: &str, body: &str
     w.flush()
 }
 
+pub fn write_bytes(w: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) -> std::io::Result<()> {
+    write!(
+        w,
+        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+        reason(status),
+        body.len()
+    )?;
+    w.write_all(body)?;
+    w.flush()
+}
+
 /// Value of query parameter `key` in `path` (`/x?a=1&b=2`), percent-decoded.
 pub fn query_param(path: &str, key: &str) -> Option<String> {
     let q = path.split_once('?')?.1;

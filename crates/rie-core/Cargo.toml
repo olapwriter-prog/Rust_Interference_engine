@@ -11,5 +11,6 @@ half = { workspace = true }
 memmap2 = { workspace = true }
 fancy-regex = { workspace = true }
 libc = { workspace = true }
+unicode-normalization = { workspace = true }
 
 [dev-dependencies]

@@ -20,6 +20,7 @@ pub mod headless;
 pub mod http;
 pub mod toolbook;
 pub mod tools;
+pub mod tts;
 pub mod ui;
 
 use rie_core::constrain::{ArgType, ToolSig};
@@ -82,6 +83,8 @@ pub struct ServerConfig {
     pub tool_recall: usize,
     /// Manifest of headless tools the server runs itself for `/v1/ask`.
     pub headless: Option<PathBuf>,
+    /// Text-to-speech engine (`--tts termux` or `--tts cmd:...`).
+    pub tts: Option<tts::Backend>,
 }
 
 impl Default for ServerConfig {
@@ -113,6 +116,7 @@ impl Default for ServerConfig {
             memory_tool: true,
             tool_recall: 0,
             headless: None,
+            tts: None,
         }
     }
 }
@@ -146,8 +150,8 @@ pub struct State {
     observed_order: VecDeque<String>,
     /// headless tools for `/v1/ask`
     pub headless: Vec<headless::HeadlessTool>,
-    /// recently generated answer pages (id, page)
-    pages: VecDeque<(String, ui::Page)>,
+    /// recently generated answer pages (id, page, spoken audio if any)
+    pages: VecDeque<(String, ui::Page, Option<Vec<u8>>)>,
 }
 
 const MAX_PAGES: usize = 32;
@@ -404,6 +408,11 @@ fn ask(body: &Value, state: &Arc<Mutex<State>>) -> Result<Value, String> {
         return Err("\"question\" must be a non-empty string".into());
     }
     let max_tools = body.get("max_tools").and_then(Value::as_u64).unwrap_or(6).clamp(1, 32) as usize;
+    // page language: explicit, or from the question's script (Telugu question → Telugu page)
+    let loc = match body.get("lang").and_then(Value::as_str) {
+        Some(l) => ui::Locale::for_lang(l),
+        None => ui::Locale::detect(&question),
+    };
     let mut st = lock(state);
     if st.headless.is_empty() {
         return Err("no headless tools are configured (start with --headless-tools FILE)".into());
@@ -477,10 +486,13 @@ fn ask(body: &Value, state: &Arc<Mutex<State>>) -> Result<Value, String> {
             );
         }
         let cat = ui::categorize(&tool.name, &tool.description, tool.category.as_deref());
-        cards.push((cat, ui::Card::new(&tool.name, out.status, out.ms, args.clone(), &out.value, out.error.as_deref(), out.truncated)));
+        cards.push((
+            cat,
+            ui::Card::new_in(&tool.name, out.status, out.ms, args.clone(), &out.value, out.error.as_deref(), out.truncated, &loc),
+        ));
     }
     let id = st.next_id("ui_");
-    let page = ui::build(&id, &question, now(), cards);
+    let page = ui::build_in(&id, &question, now(), cards, &loc);
     if let Some(mem) = &mut st.memory {
         mem.record(Kind::User, "", None, 0.3, &question);
         let cats: Vec<&str> = page.sections.iter().map(|s| ui::CATEGORIES[s.category].title).collect();
@@ -493,8 +505,27 @@ fn ask(body: &Value, state: &Arc<Mutex<State>>) -> Result<Value, String> {
         );
     }
     st.toolbook.save();
-    let out = json!({"id": id, "ui_url": format!("/ui/{id}"), "ui": page.to_json(), "markdown": page.to_markdown()});
-    st.pages.push_back((id, page));
+    // spoken summary in the page's language, ready for any TTS (also the app's own)
+    let speech = rie_core::speech::verbalize(&page.speech_text(), loc.lang);
+    let mut out = json!({"id": id, "ui_url": format!("/ui/{id}"), "ui": page.to_json(), "markdown": page.to_markdown(), "lang": loc.lang, "speech": speech});
+    let backend = st.cfg.tts.clone();
+    drop(st);
+    let mut audio = None;
+    if body.get("speak").and_then(Value::as_bool).unwrap_or(false) {
+        match &backend {
+            None => out["speech_error"] = json!("no TTS engine configured (start with --tts termux or --tts cmd:...)"),
+            Some(b) => match tts::say(b, &page.speech_text(), loc.lang, body.get("voice").and_then(Value::as_str).unwrap_or("")) {
+                Ok((tts::Spoken::Audio(a), _, _)) => {
+                    out["speech_url"] = json!(format!("/ui/{id}.wav"));
+                    audio = Some(a);
+                }
+                Ok((tts::Spoken::Played, _, _)) => out["spoken"] = json!(true),
+                Err(e) => out["speech_error"] = json!(e),
+            },
+        }
+    }
+    let mut st = lock(state);
+    st.pages.push_back((id, page, audio));
     while st.pages.len() > MAX_PAGES {
         st.pages.pop_front();
     }
@@ -509,18 +540,25 @@ const SELECT_STOP: &[&str] = &[
 ];
 
 fn select_words(text: &str) -> HashSet<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.len() > 1 && !SELECT_STOP.contains(w))
-        .map(|w| match w.strip_suffix('s') {
-            Some(b) if b.len() >= 3 && !b.ends_with('s') => b.to_string(),
-            _ => w.to_string(),
-        })
-        .collect()
+    // the same light stemming for question words, lexicon concepts and tool descriptions
+    let stem = |w: &str| match w.strip_suffix('s') {
+        Some(b) if b.len() >= 3 && !b.ends_with('s') => b.to_string(),
+        _ => w.to_string(),
+    };
+    let mut out = HashSet::new();
+    for w in rie_core::text::words(&rie_core::text::normalize(text)) {
+        if w.chars().count() < 2 || SELECT_STOP.contains(&w.as_str()) {
+            continue;
+        }
+        // Telugu/Hindi words map to the English concepts tools are described with
+        for c in rie_core::text::concepts(&w) {
+            out.insert(stem(c));
+        }
+        out.insert(stem(&w));
+    }
+    out
 }
 
-/// Tools relevant to a question: every tool sharing a meaningful word with it (name
-/// words count double), best first; without any shared word, close lexical neighbours.
 fn select_tools(question: &str, tools: &[headless::HeadlessTool], book: &ToolBook, max: usize) -> Vec<String> {
     let q = select_words(question);
     let mut hits: Vec<(usize, usize)> = tools
@@ -529,7 +567,9 @@ fn select_tools(question: &str, tools: &[headless::HeadlessTool], book: &ToolBoo
         .map(|(i, t)| {
             let name = select_words(&t.name);
             let desc = select_words(&format!("{} {}", t.description, t.category.as_deref().unwrap_or("")));
-            (q.iter().map(|w| 2 * name.contains(w) as usize + desc.contains(w) as usize).sum(), i)
+            // manifest keywords (any language) match as word prefixes, like the lexicon
+            let kw = q.iter().filter(|w| t.keywords.iter().any(|k| w.starts_with(k.as_str()))).count();
+            (q.iter().map(|w| 2 * name.contains(w) as usize + desc.contains(w) as usize).sum::<usize>() + 2 * kw, i)
         })
         .filter(|(s, _)| *s > 0)
         .collect();
@@ -770,6 +810,48 @@ fn route(req: &http::Request, w: &mut TcpStream, state: &Arc<Mutex<State>>) -> s
             let id = mem.record(kind, tool, body.get("ok").and_then(Value::as_bool), importance, text);
             http::write_json(w, 200, &json!({"ok": true, "id": id, "stored": id.is_some(), "count": mem.len()}).to_string())?
         }
+        ("POST", "/v1/speech/prepare") => {
+            // text ready for a TTS voice: works without a server-side engine (apps can use
+            // Android TextToSpeech / AVSpeechSynthesizer with it)
+            let input = body.get("input").and_then(Value::as_str).unwrap_or("");
+            let lang = body
+                .get("language")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| rie_core::text::detect_script(input).lang().to_string());
+            let text = rie_core::speech::verbalize(input, &lang);
+            let sentences = rie_core::speech::sentences(&text, 300);
+            http::write_json(w, 200, &json!({"language": lang, "text": text, "sentences": sentences}).to_string())?
+        }
+        ("POST", "/v1/audio/speech") => {
+            let input = body.get("input").and_then(Value::as_str).unwrap_or("").to_string();
+            let backend = lock(state).cfg.tts.clone();
+            let Some(backend) = backend else {
+                http::write_json(
+                    w,
+                    400,
+                    &err_json("no TTS engine configured (start with --tts termux or --tts cmd:...)", "invalid_request_error"),
+                )?;
+                return Ok(true);
+            };
+            if input.trim().is_empty() {
+                http::write_json(w, 400, &err_json("\"input\" must be non-empty text", "invalid_request_error"))?;
+                return Ok(true);
+            }
+            let lang = body
+                .get("language")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| rie_core::text::detect_script(&input).lang().to_string());
+            let voice = body.get("voice").and_then(Value::as_str).unwrap_or("").to_string();
+            match tts::say(&backend, &input, &lang, &voice) {
+                Ok((tts::Spoken::Audio(a), _, _)) => http::write_bytes(w, 200, "audio/wav", &a)?,
+                Ok((tts::Spoken::Played, text, n)) => {
+                    http::write_json(w, 200, &json!({"spoken": true, "language": lang, "text": text, "sentences": n}).to_string())?
+                }
+                Err(e) => http::write_json(w, 500, &err_json(&e, "server_error"))?,
+            }
+        }
         ("POST", "/v1/ask") => match ask(&body, state) {
             Ok(v) => http::write_json(w, 200, &v.to_string())?,
             Err(e) => http::write_json(w, 400, &err_json(&e, "invalid_request_error"))?,
@@ -777,7 +859,7 @@ fn route(req: &http::Request, w: &mut TcpStream, state: &Arc<Mutex<State>>) -> s
         ("GET", "/ui") => {
             let st = lock(state);
             let mut h = String::from("<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Answers</title><body style=\"font:15px system-ui;margin:16px\"><h1>Answers</h1><ul>");
-            for (id, p) in st.pages.iter().rev() {
+            for (id, p, _) in st.pages.iter().rev() {
                 h.push_str(&format!("<li><a href=\"/ui/{id}\">{}</a> · {}</li>", ui::esc(&p.question), ui::fmt_time(p.created)));
             }
             h.push_str("</ul></body>");
@@ -787,13 +869,21 @@ fn route(req: &http::Request, w: &mut TcpStream, state: &Arc<Mutex<State>>) -> s
             let st = lock(state);
             let rest = &p["/ui/".len()..];
             let (id, kind) = match rest.rsplit_once('.') {
-                Some((i, k)) if k == "json" || k == "md" => (i, k),
+                Some((i, k)) if k == "json" || k == "md" || k == "wav" => (i, k),
                 _ => (rest, "html"),
             };
-            match st.pages.iter().find(|(i, _)| i == id) {
-                Some((_, page)) => match kind {
+            match st.pages.iter().find(|(i, _, _)| i == id) {
+                Some((_, page, audio)) => match kind {
                     "json" => http::write_json(w, 200, &page.to_json().to_string())?,
                     "md" => http::write_text(w, 200, "text/markdown; charset=utf-8", &page.to_markdown())?,
+                    "wav" => match audio {
+                        Some(a) => http::write_bytes(w, 200, "audio/wav", a)?,
+                        None => http::write_json(
+                            w,
+                            404,
+                            &err_json("this page has no audio (ask with \"speak\": true and a file-writing --tts engine)", "not_found"),
+                        )?,
+                    },
                     _ => http::write_text(w, 200, "text/html; charset=utf-8", &page.to_html())?,
                 },
                 None => http::write_json(w, 404, &err_json("unknown page (only recent pages are kept)", "not_found"))?,
@@ -969,6 +1059,20 @@ fn chat(body: &Value, w: &mut TcpStream, state: &Arc<Mutex<State>>) -> std::io::
     let model = st.alias.clone();
     let created = now();
 
+    // speak the reply while it is generated (engines that play audio themselves)
+    let mut speaker = match (&st.cfg.tts, body.get("speak").and_then(Value::as_bool).unwrap_or(false)) {
+        (Some(b), true) if !b.writes_files() => {
+            let user = msgs.iter().rev().find(|m| m.role == "user").map(|m| m.content.as_str()).unwrap_or("");
+            let lang = body
+                .get("language")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| rie_core::text::detect_script(user).lang().to_string());
+            Some(tts::Speaker::start(b.clone(), &lang, body.get("voice").and_then(Value::as_str).unwrap_or("")))
+        }
+        _ => None,
+    };
+    let mut spoken: usize;
     if stream {
         http::start_sse(w)?;
         let first = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
@@ -1005,11 +1109,19 @@ fn chat(body: &Value, w: &mut TcpStream, state: &Arc<Mutex<State>>) -> std::io::
         let mut json_filter = JsonModeFilter::new(json_mode && !use_tools, st.cfg.max_string, st.cfg.max_call);
         let mut text = String::new();
         let mut emitted = 0usize;
+        spoken = 0; // each internal round generates fresh text
         let mut broken = false;
         let res = {
             let wref = &mut *w;
             let mut on_text = |piece: &str| -> bool {
                 text.push_str(piece);
+                if let Some(sp) = speaker.as_mut() {
+                    let vis = visible_prefix(&text, format, use_tools);
+                    if vis.len() > spoken && vis.is_char_boundary(spoken) {
+                        sp.feed(&vis[spoken..]);
+                        spoken = vis.len();
+                    }
+                }
                 if stream {
                     let vis = visible_prefix(&text, format, use_tools);
                     if vis.len() > emitted && vis.is_char_boundary(emitted) {
@@ -1100,6 +1212,10 @@ fn chat(body: &Value, w: &mut TcpStream, state: &Arc<Mutex<State>>) -> std::io::
         }
         break (stats, content, call, filter, tokens, emitted);
     };
+    if let Some(sp) = speaker.take() {
+        // finish speaking in the background; the HTTP response does not wait for audio
+        std::thread::spawn(move || sp.finish());
+    }
     if let Some(mem) = &mut st.memory {
         match &call {
             Some(c) => mem.record(Kind::Action, &c.name, None, 0.2, &format!("called {}({})", c.name, clip(&c.arguments.to_string(), 300))),
@@ -1330,6 +1446,7 @@ pub fn parse_args(args: &[String]) -> Result<ServerConfig, String> {
             "--recall" => c.recall = val(&mut i)?.parse().map_err(|_| "bad --recall")?,
             "--no-memory-tool" => c.memory_tool = false,
             "--headless-tools" => c.headless = Some(PathBuf::from(val(&mut i)?)),
+            "--tts" => c.tts = Some(tts::Backend::parse(&val(&mut i)?)?),
             "--tool-recall" => c.tool_recall = val(&mut i)?.parse().map_err(|_| "bad --tool-recall")?,
             "--mlock" => c.mlock = true,
             "--gpu" => c.gpu = true,
@@ -1437,6 +1554,14 @@ ask the phone (headless tools + on-the-fly UI):
                           POST /v1/ask {question: ...} picks every relevant tool, fills
                           arguments with the model, runs them in parallel and returns a
                           categorized page: /ui/ID (HTML), /ui/ID.json, /ui/ID.md
+
+speech (Indian languages: numbers, currency and times are spoken as words):
+      --tts termux        speak with Android's system TTS (Termux:API; Telugu/Hindi voices)
+      --tts 'cmd:PROG ARGS'  any local engine; placeholders {text} {lang} {voice} {out}
+                          (with {out} it writes WAV files, e.g. sherpa-onnx; else it plays)
+      POST /v1/audio/speech {input, language?, voice?}   speak or return audio/wav
+      POST /v1/speech/prepare {input, language?}          verbalized text + sentences for any TTS
+      speak: true on /v1/ask and /v1/chat/completions speaks the answer
 
 online learning (reinforcement learning from feedback):
       --rl                enable correction experts (in memory)

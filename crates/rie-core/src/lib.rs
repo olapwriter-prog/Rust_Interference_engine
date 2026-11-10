@@ -30,9 +30,11 @@ pub mod ops;
 pub mod quant;
 pub mod rl;
 pub mod sampler;
+pub mod speech;
 pub mod tensor;
 #[doc(hidden)]
 pub mod testing;
+pub mod text;
 pub mod threadpool;
 pub mod tokenizer;
 pub mod turbo;

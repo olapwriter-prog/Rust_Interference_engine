@@ -199,9 +199,34 @@ impl Tokenizer {
     }
 
     fn encode_text(&self, text: &str, at_start: bool, out: &mut Vec<u32>) {
+        // Canonical composition (NFC): Indic text from PDFs, OCR or some keyboards can
+        // arrive decomposed (e.g. Telugu ై as U+0C46 U+0C56), which models never saw in
+        // training and which costs extra tokens. NFC leaves already-composed text alone.
+        let normalized;
+        let text = if unicode_normalization::is_nfc_quick(text.chars()) == unicode_normalization::IsNormalized::Yes {
+            text
+        } else {
+            normalized = unicode_normalization::UnicodeNormalization::nfc(text).collect::<String>();
+            &normalized
+        };
         match &self.kind {
             Kind::Spm(s) => s.encode(text, at_start, &self.token_to_id, out),
             Kind::Bpe(b) => b.encode(text, &self.token_to_id, out),
+        }
+    }
+
+    /// How efficiently this tokenizer encodes `text` (see [`TokStats`]).
+    pub fn stats(&self, text: &str) -> TokStats {
+        let ids = self.encode(text, false, false);
+        let partial = ids.iter().filter(|&&t| std::str::from_utf8(self.token_bytes(t)).is_err()).count();
+        let words = text.split_whitespace().filter(|w| w.chars().any(char::is_alphanumeric)).count();
+        TokStats {
+            words,
+            chars: text.chars().count(),
+            bytes: text.len(),
+            tokens: ids.len(),
+            partial_tokens: partial,
+            round_trip: self.decode(&ids, false) == text,
         }
     }
 
@@ -236,6 +261,11 @@ impl Tokenizer {
         let mut bytes = Vec::new();
         for &t in ids {
             bytes.extend(self.decode_token(t, show_special));
+        }
+        // SentencePiece prepends a space to the text when encoding; drop it again (as
+        // llama.cpp does) so decode(encode(text)) == text
+        if matches!(&self.kind, Kind::Spm(sp) if sp.adds_space_prefix()) && bytes.first() == Some(&b' ') {
+            bytes.remove(0);
         }
         String::from_utf8_lossy(&bytes).into_owned()
     }
@@ -281,5 +311,31 @@ impl Utf8Stream {
         let s = String::from_utf8_lossy(&self.buf).into_owned();
         self.buf.clear();
         s
+    }
+}
+
+/// Tokenization efficiency of a text. *Fertility* (tokens per word) is the number that
+/// matters for Indian languages: it sets how much context a conversation uses and how
+/// many forward passes a reply costs. Sarvam reports 1.4–2.1 for its Indic tokenizer,
+/// against up to ~8 for tokenizers trained mostly on English.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokStats {
+    pub words: usize,
+    pub chars: usize,
+    pub bytes: usize,
+    pub tokens: usize,
+    /// tokens holding an incomplete UTF-8 sequence (byte fallback: a character split
+    /// across several tokens)
+    pub partial_tokens: usize,
+    /// decode(encode(text)) == text
+    pub round_trip: bool,
+}
+
+impl TokStats {
+    pub fn fertility(&self) -> f32 {
+        self.tokens as f32 / self.words.max(1) as f32
+    }
+    pub fn chars_per_token(&self) -> f32 {
+        self.chars as f32 / self.tokens.max(1) as f32
     }
 }

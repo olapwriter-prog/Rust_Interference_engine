@@ -37,6 +37,10 @@ struct Sym {
 }
 
 impl Spm {
+    pub fn adds_space_prefix(&self) -> bool {
+        self.add_space_prefix
+    }
+
     pub fn new(tokens: &[String], scores: &[f32], types: &[TokenType], add_space_prefix: bool, unk: Option<u32>) -> Self {
         let mut byte_tokens = [None; 256];
         for (i, t) in tokens.iter().enumerate() {

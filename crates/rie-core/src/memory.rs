@@ -114,9 +114,9 @@ pub fn embed(text: &str) -> Vec<f32> {
         let sign = if h >> 63 == 0 { 1.0 } else { -1.0 };
         v[(h as usize) % EMBED_DIM] += sign * w;
     };
-    let lower = text.to_lowercase();
+    let lower = crate::text::normalize(text).to_lowercase();
     let words: Vec<&str> =
-        lower.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|w| !w.is_empty() && !STOP.contains(w)).take(400).collect();
+        lower.split(|c: char| !crate::text::is_word_char(c)).filter(|w| !w.is_empty() && !STOP.contains(w)).take(400).collect();
     for (i, w) in words.iter().enumerate() {
         add(format!("w:{w}").as_bytes(), 1.0);
         // parts of snake_case identifiers

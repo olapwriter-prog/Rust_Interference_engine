@@ -94,6 +94,25 @@ harnesses such as the stitaP tool harness:
 
 See [docs/tool-harness.md](docs/tool-harness.md).
 
+## Indian languages and speech
+
+- **Measured:** Telugu costs 8.7–14.8× more tokens than the same English text on common
+  tokenizers, against Sarvam's reported 1.4–2.1 tokens/word for Sarvam-1. `rie tokstats`
+  measures any model, so you can choose a model before deploying.
+- **Correct handling of Indian scripts:**
+  - NFC normalization before tokenizing;
+  - exact round-trip, and streaming that never splits a letter;
+  - UTF-8-safe constrained tool calls;
+  - Indic-aware word splitting for memory and tool selection;
+  - a Telugu/Hindi lexicon for picking tools described in English.
+- **Telugu and Hindi answer pages** with Indian digit grouping.
+- **Speech:** numbers, currency (₹, lakh, crore), percentages and times are spoken as
+  Telugu or Hindi words. Text goes to the voice sentence by sentence while the reply
+  streams, through Android's system TTS or any local engine (`--tts`),
+  `/v1/audio/speech` and `/v1/speech/prepare`.
+
+See [docs/indian-languages.md](docs/indian-languages.md).
+
 ## Repository layout
 
 ```

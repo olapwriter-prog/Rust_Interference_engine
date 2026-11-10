@@ -1,0 +1,79 @@
+# lang	stem (matched as a word prefix, NFC)	concept keywords (English, as used in tool descriptions)
+# Telugu and Hindi words are agglutinated or inflected (వాతావరణం → వాతావరణాన్ని), so stems
+# drop endings such as ం. Review by native speakers welcome; extend freely.
+te	వాతావరణ	weather forecast
+te	వర్ష	rain weather
+te	ఉష్ణోగ్రత	temperature weather
+te	క్యాలెండర్	calendar events
+te	సమావేశ	meeting calendar events
+te	మీటింగ్	meeting calendar events
+te	అపాయింట్	appointment calendar
+te	పనులు	tasks todo
+te	గుర్తు	reminder tasks
+te	రిమైండర్	reminder tasks
+te	బ్యాంక	bank account balance
+te	ఖాతా	account bank
+te	బ్యాలెన్స్	balance bank
+te	డబ్బు	money balance bank
+te	ఖర్చ	spending expense
+te	చెల్లింపు	payment
+te	వార్త	news headlines
+te	సందేశ	messages sms
+te	మెసేజ్	messages sms
+te	కాల్	call
+te	కాంటాక్ట్	contacts
+te	బ్యాటరీ	battery
+te	ఛార్జ్	battery
+te	వైఫై	wifi
+te	అడుగు	steps health
+te	నడిచ	steps walk health
+te	ఆరోగ్య	health
+te	నిద్ర	sleep health
+te	గుండె	heart health
+te	ఫైల్	files documents
+te	పత్ర	documents files
+te	ఫోటో	photos files
+te	స్థాన	location
+te	లొకేషన్	location
+te	ఎక్కడ	location nearby
+te	దారి	route directions
+te	మార్గ	route directions
+te	ట్రాఫిక్	traffic
+te	రైలు	train transit
+te	బస్సు	bus transit
+te	హోటల్	hotel nearby
+te	సమీప	nearby location
+te	నోట్స్	notes
+te	గమనిక	notes
+te	వెతుకు	search
+hi	मौसम	weather forecast
+hi	बारिश	rain weather
+hi	तापमान	temperature weather
+hi	कैलेंडर	calendar events
+hi	मीटिंग	meeting calendar events
+hi	बैठक	meeting calendar events
+hi	काम	tasks todo
+hi	याद	reminder tasks
+hi	बैंक	bank account balance
+hi	खाता	account bank
+hi	खाते	account bank
+hi	बैलेंस	balance bank
+hi	पैसे	money balance bank
+hi	खर्च	spending expense
+hi	खबर	news headlines
+hi	समाचार	news headlines
+hi	संदेश	messages sms
+hi	मैसेज	messages sms
+hi	बैटरी	battery
+hi	कदम	steps health
+hi	स्वास्थ्य	health
+hi	नींद	sleep health
+hi	फ़ाइल	files documents
+hi	फाइल	files documents
+hi	स्थान	location
+hi	लोकेशन	location
+hi	कहाँ	location nearby
+hi	ट्रैफिक	traffic
+hi	ट्रेन	train transit
+hi	होटल	hotel nearby
+hi	नोट्स	notes

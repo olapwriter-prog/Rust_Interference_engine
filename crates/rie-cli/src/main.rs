@@ -31,6 +31,14 @@ enum Cmd {
     Bench(BenchArgs),
     /// Show model metadata.
     Info { model: PathBuf },
+    /// Tokenizer efficiency on text files (fertility = tokens per word); works with
+    /// vocab-only GGUF files too. Compare models before picking one for a language.
+    Tokstats {
+        model: PathBuf,
+        /// Text files to measure.
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+    },
     /// Show CPU topology, SIMD features and GPUs.
     Device,
     /// Write a synthetic model (random weights, real shapes) to a GGUF file for testing.
@@ -301,6 +309,29 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(feature = "gpu")]
             for a in rie_gpu::list_adapters() {
                 println!("GPU: {a}");
+            }
+        }
+        Cmd::Tokstats { model, files } => {
+            let g = GgufFile::open(&model)?;
+            let tok = rie_core::Tokenizer::from_gguf(&g)?;
+            println!(
+                "{:<28} {:>7} {:>7} {:>9} {:>11} {:>9} {:>10}",
+                "file", "words", "tokens", "fertility", "chars/token", "partial", "round-trip"
+            );
+            for f in files {
+                let text = std::fs::read_to_string(&f)?;
+                let s = tok.stats(&text);
+                let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                println!(
+                    "{:<28} {:>7} {:>7} {:>9.2} {:>11.2} {:>8.0}% {:>10}",
+                    name,
+                    s.words,
+                    s.tokens,
+                    s.fertility(),
+                    s.chars_per_token(),
+                    100.0 * s.partial_tokens as f32 / s.tokens.max(1) as f32,
+                    if s.round_trip { "ok" } else { "MISMATCH" }
+                );
             }
         }
         Cmd::Info { model } => {
